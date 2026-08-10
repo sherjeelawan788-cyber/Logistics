@@ -23,6 +23,7 @@ sidebar to populate the database with realistic demo data for testing.
 ==============================================================================
 """
 
+import hashlib
 import json
 import os
 import random
@@ -225,28 +226,29 @@ def stat_cards(cards: list) -> None:
 
 
 # ==============================================================================
-# HQ AUTHENTICATION  -- real "Sign in with Google" (Admin = you, everyone
-# else who signs in with their OWN Google account = read-only Viewer)
+# HQ ACCESS CONTROL  -- one Admin (you, email+password) + tracked Viewers
 # ==============================================================================
-# This uses Streamlit's built-in st.login()/st.user, which is a proper
-# OAuth 2.0 / OpenID Connect flow against Google -- clicking "Sign in with
-# Google" sends the person to accounts.google.com to sign in for real.
-# There is no emailed confirmation code (that's a different kind of login
-# flow); Google itself verifies the person's identity and redirects them
-# back here.
+# The first person to open the app sets up the one Admin account (email +
+# password). That password is never stored in plain text -- only a salted
+# hash, saved to a local file (hq_owner.json) next to the database.
 #
-# SETUP REQUIRED (one-time, done by you -- see the README in this
-# package): you must create a Google OAuth Client ID in Google Cloud
-# Console and put its client_id/client_secret into a local
-# .streamlit/secrets.toml file. Streamlit reads that file automatically;
-# nothing in THIS code contains your credentials.
+# Everyone else who opens the app is asked for just a NAME and EMAIL (no
+# password) to "Continue as Viewer" -- this is what lets you see exactly
+# who has looked at the dashboard: every viewer who has ever identified
+# themselves is logged with first-seen/last-seen times and whether they
+# currently look "online" (active in the last few minutes). You can
+# revoke ("Remove") any viewer's access at any time from the sidebar --
+# a removed person is blocked from continuing as a viewer again until you
+# restore them.
 #
-# The very FIRST Google account that ever signs in becomes the HQ Admin
-# automatically (that should be you). Everyone after that who signs in
-# with a DIFFERENT Google account is a Viewer -- they can see every tab
-# but cannot upload, edit, seed, or clear data. Every Google account that
-# has ever signed in is logged (email, name, first/last seen, visit
-# count) so you can see exactly who has access, in the sidebar.
+# HONESTY NOTE (also shown in the app): a name/email here is
+# self-reported, not verified -- anyone could type someone else's name.
+# This is lightweight tracking for a trusted team, not strong identity
+# verification or enterprise-grade security.
+
+
+def _hash_password(password: str, salt: str) -> str:
+    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
 
 
 def _load_owner_config():
@@ -259,144 +261,269 @@ def _load_owner_config():
         return None
 
 
-def _save_owner_config(owner_email: str) -> dict:
-    config = {"owner_email": owner_email.strip().lower()}
+def _save_owner_config(email: str, password: str) -> dict:
+    salt = os.urandom(16).hex()
+    config = {
+        "email": email.strip().lower(),
+        "salt": salt,
+        "password_hash": _hash_password(password, salt),
+    }
     with open(OWNER_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f)
     return config
 
 
-def is_admin() -> bool:
-    """True only for the HQ owner's Google account -- use this to gate
-    anything that uploads, edits, seeds, or clears data."""
-    if not (hasattr(st, "user") and st.user.is_logged_in):
-        return False
-    config = _load_owner_config()
+def _verify_owner(email: str, password: str, config: dict) -> bool:
     if not config:
         return False
-    return st.user.email.strip().lower() == config.get("owner_email", "")
+    if email.strip().lower() != config.get("email", ""):
+        return False
+    return _hash_password(password, config.get("salt", "")) == config.get("password_hash", "")
 
 
-def _record_access(email: str, name: str) -> None:
-    """Log every Google account that has ever signed in, so the Admin can
-    see exactly who has access to this dashboard."""
-    conn = get_connection()
+def is_admin() -> bool:
+    """True only for the signed-in HQ Admin -- use this to gate anything
+    that uploads, edits, seeds, or clears data."""
+    return st.session_state.get("auth_role") == "admin"
+
+
+ONLINE_WINDOW_MINUTES = 5  # "online now" = active within this many minutes
+
+
+def _ensure_viewer_table(conn) -> None:
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS access_log (
-            email TEXT PRIMARY KEY,
-            name TEXT,
+        CREATE TABLE IF NOT EXISTS viewer_log (
+            email      TEXT PRIMARY KEY,
+            name       TEXT,
             first_seen TEXT,
-            last_seen TEXT,
-            visit_count INTEGER NOT NULL DEFAULT 1
+            last_seen  TEXT,
+            visits     INTEGER NOT NULL DEFAULT 1,
+            blocked    INTEGER NOT NULL DEFAULT 0
         )
         """
     )
+
+
+def _is_viewer_blocked(email: str) -> bool:
+    conn = get_connection()
+    _ensure_viewer_table(conn)
+    row = conn.execute("SELECT blocked FROM viewer_log WHERE email = ?", (email.strip().lower(),)).fetchone()
+    conn.close()
+    return bool(row and row[0])
+
+
+def _record_viewer_visit(email: str, name: str) -> None:
+    """Log this viewer's visit (insert new, or refresh name/last_seen and
+    bump their visit count) -- also silently keeps their session 'online'
+    on every rerun while they're using the dashboard."""
+    conn = get_connection()
+    _ensure_viewer_table(conn)
     email = email.strip().lower()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    existing = conn.execute("SELECT visit_count FROM access_log WHERE email = ?", (email,)).fetchone()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    existing = conn.execute("SELECT visits FROM viewer_log WHERE email = ?", (email,)).fetchone()
     if existing:
         conn.execute(
-            "UPDATE access_log SET name = ?, last_seen = ?, visit_count = visit_count + 1 WHERE email = ?",
+            "UPDATE viewer_log SET name = ?, last_seen = ?, visits = visits + 1 WHERE email = ?",
             (name, now, email),
         )
     else:
         conn.execute(
-            "INSERT INTO access_log (email, name, first_seen, last_seen, visit_count) VALUES (?, ?, ?, ?, 1)",
+            "INSERT INTO viewer_log (email, name, first_seen, last_seen, visits, blocked) "
+            "VALUES (?, ?, ?, ?, 1, 0)",
             (email, name, now, now),
         )
     conn.commit()
     conn.close()
 
 
-def render_auth_gate() -> bool:
-    """Shows a 'Sign in with Google' screen until someone is authenticated
-    via a real Google account. Returns True once it's OK to show the
-    dashboard."""
-    if not hasattr(st, "user"):
-        st.error(
-            "This Streamlit version doesn't support built-in login. "
-            "Please update it: `pip install -U streamlit`"
-        )
-        return False
+def _set_viewer_blocked(email: str, blocked: bool) -> None:
+    conn = get_connection()
+    _ensure_viewer_table(conn)
+    conn.execute("UPDATE viewer_log SET blocked = ? WHERE email = ?", (1 if blocked else 0, email.strip().lower()))
+    conn.commit()
+    conn.close()
 
-    if not st.user.is_logged_in:
-        st.markdown(
-            "<h1 style='text-align:center; margin-bottom:0;'>\U0001F3E2 HQ</h1>"
-            "<p style='text-align:center; opacity:0.65; margin-top:0;'>"
-            "Delivery Logistics &amp; Payroll Dashboard</p>",
-            unsafe_allow_html=True,
-        )
-        _, mid, _ = st.columns([1, 1, 1])
-        with mid:
-            st.write("")
-            if st.button("\U0001F510 Sign in with Google", type="primary", use_container_width=True):
-                st.login()
-            st.caption(
-                "You'll be sent to Google's real sign-in page. The first "
-                "Google account to ever sign in becomes the HQ Admin; "
-                "everyone else who signs in with their own Google account "
-                "is a read-only Viewer."
-            )
-        return False
+
+def render_auth_gate() -> bool:
+    """Shows first-run Admin setup (once), then a sign-in / continue-as-
+    viewer screen on every subsequent run until someone picks one. Returns
+    True once it's OK to show the actual dashboard."""
+    if "auth_role" not in st.session_state:
+        st.session_state.auth_role = None
+        st.session_state.auth_email = None
+        st.session_state.auth_name = None
+
+    if st.session_state.auth_role == "admin":
+        return True
+    if st.session_state.auth_role == "viewer":
+        if _is_viewer_blocked(st.session_state.auth_email):
+            st.session_state.auth_role = None
+            st.error("Your access to this dashboard has been removed by the HQ Admin.")
+            return False
+        _record_viewer_visit(st.session_state.auth_email, st.session_state.auth_name)
+        return True
+
+    st.markdown(
+        "<h1 style='text-align:center; margin-bottom:0;'>\U0001F3E2 HQ</h1>"
+        "<p style='text-align:center; opacity:0.65; margin-top:0;'>"
+        "Delivery Logistics &amp; Payroll Dashboard</p>",
+        unsafe_allow_html=True,
+    )
 
     config = _load_owner_config()
-    if config is None:
-        _save_owner_config(st.user.email)
 
-    _record_access(st.user.email, st.user.get("name", ""))
-    return True
+    if config is None:
+        st.info(
+            "\U0001F510 **First-time setup** -- create the HQ Admin account. "
+            "Only this account can upload files, seed/clear data, or make "
+            "any changes. Everyone else can view the dashboards but not "
+            "edit anything."
+        )
+        st.caption(
+            "Note: this is basic password protection meant for a trusted "
+            "team, not enterprise-grade security -- don't reuse a "
+            "sensitive password here."
+        )
+        with st.form("hq_setup_form"):
+            email = st.text_input("Your email (this becomes the HQ Admin login)")
+            pw1 = st.text_input("Choose a password", type="password")
+            pw2 = st.text_input("Confirm password", type="password")
+            submitted = st.form_submit_button("Create Admin Account", type="primary")
+        if submitted:
+            if not email or "@" not in email:
+                st.error("Please enter a valid email address.")
+            elif len(pw1) < 6:
+                st.error("Password should be at least 6 characters.")
+            elif pw1 != pw2:
+                st.error("Passwords don't match.")
+            else:
+                _save_owner_config(email, pw1)
+                st.session_state.auth_role = "admin"
+                st.session_state.auth_email = email.strip().lower()
+                st.success("Admin account created!")
+                st.rerun()
+        return False
+
+    tab_admin, tab_viewer = st.tabs(["\U0001F511 Admin Sign In", "\U0001F441\uFE0F Continue as Viewer"])
+
+    with tab_admin:
+        with st.form("hq_login_form"):
+            email = st.text_input("Email")
+            pw = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign In", type="primary")
+        if submitted:
+            if _verify_owner(email, pw, config):
+                st.session_state.auth_role = "admin"
+                st.session_state.auth_email = config["email"]
+                st.rerun()
+            else:
+                st.error("Incorrect email or password.")
+
+    with tab_viewer:
+        st.write(
+            "Viewers can see every dashboard, report, and rider lookup, "
+            "but cannot upload files, seed demo data, clear data, or make "
+            "any changes."
+        )
+        st.caption(
+            "Enter your name and email so the HQ Admin can see who has "
+            "viewed this dashboard."
+        )
+        with st.form("hq_viewer_form"):
+            v_name = st.text_input("Your name")
+            v_email = st.text_input("Your email")
+            submitted = st.form_submit_button("Continue as Viewer", use_container_width=True)
+        if submitted:
+            if not v_name.strip():
+                st.error("Please enter your name.")
+            elif not v_email or "@" not in v_email:
+                st.error("Please enter a valid email address.")
+            elif _is_viewer_blocked(v_email):
+                st.error("This email's access has been removed by the HQ Admin.")
+            else:
+                st.session_state.auth_role = "viewer"
+                st.session_state.auth_email = v_email.strip().lower()
+                st.session_state.auth_name = v_name.strip()
+                st.rerun()
+
+    return False
 
 
 def render_hq_banner():
     """HQ branding + the signed-in person's email, right-aligned at the
-    top of the dashboard."""
+    top of the dashboard (not centered)."""
     config = _load_owner_config()
-    owner_email = config["owner_email"] if config else ""
-    role_label = "Admin (edit access)" if is_admin() else "Viewer (read-only)"
+    owner_email = config["email"] if config else ""
+    role = st.session_state.get("auth_role")
+    if role == "admin":
+        who = owner_email
+        role_label = "Admin (edit access)"
+    else:
+        who = st.session_state.get("auth_email", "")
+        role_label = "Viewer (read-only)"
     st.markdown(
         f"""
         <div style="display:flex; justify-content:flex-end; align-items:center;
                     gap:8px; padding:2px 4px 8px 0; flex-wrap:wrap;">
           <span style="font-weight:900; letter-spacing:2px; font-size:14px;">\U0001F3E2 HQ</span>
           <span style="opacity:0.4;">|</span>
-          <span style="opacity:0.85; font-size:12.5px;">{st.user.email}</span>
+          <span style="opacity:0.85; font-size:12.5px;">{who}</span>
           <span style="opacity:0.4;">|</span>
           <span style="opacity:0.7; font-size:12.5px;">{role_label}</span>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    _ = owner_email  # (kept for the sidebar's "who has access" panel, not shown here)
 
 
 def render_hq_access_panel():
-    """Admin-only sidebar panel listing every Google account that has ever
-    signed in -- answers 'kis kis ke paas dashboard access hai'."""
+    """Admin-only sidebar panel listing every viewer who has ever
+    identified themselves, whether they look online right now, and a
+    button to remove (or restore) their access."""
     conn = get_connection()
-    try:
-        df = pd.read_sql_query(
-            "SELECT email, name, first_seen, last_seen, visit_count FROM access_log ORDER BY last_seen DESC",
-            conn,
-        )
-    except Exception:  # noqa: BLE001 - table doesn't exist yet (no one but you has ever logged in)
-        df = pd.DataFrame(columns=["email", "name", "first_seen", "last_seen", "visit_count"])
+    _ensure_viewer_table(conn)
+    df = pd.read_sql_query(
+        "SELECT email, name, first_seen, last_seen, visits, blocked FROM viewer_log ORDER BY last_seen DESC",
+        conn,
+    )
     conn.close()
 
-    with st.sidebar.expander(f"\U0001F465 Who has access ({len(df)})", expanded=False):
+    online_count = 0
+    if not df.empty:
+        cutoff = datetime.now() - timedelta(minutes=ONLINE_WINDOW_MINUTES)
+        last_seen_dt = pd.to_datetime(df["last_seen"], errors="coerce")
+        online_count = int(((last_seen_dt >= cutoff) & (df["blocked"] == 0)).sum())
+
+    with st.sidebar.expander(f"\U0001F465 Who has viewed ({len(df)}) \u2022 \U0001F7E2 {online_count} online", expanded=False):
         if df.empty:
-            st.caption("No sign-ins recorded yet.")
+            st.caption("No viewers have identified themselves yet.")
         else:
-            st.dataframe(
-                df.rename(columns={
-                    "email": "Email", "name": "Name", "first_seen": "First seen",
-                    "last_seen": "Last seen", "visit_count": "Visits",
-                }),
-                use_container_width=True, hide_index=True,
-            )
+            cutoff = datetime.now() - timedelta(minutes=ONLINE_WINDOW_MINUTES)
+            for _, row in df.iterrows():
+                last_seen_dt = pd.to_datetime(row["last_seen"], errors="coerce")
+                is_online = bool(row["blocked"] == 0 and pd.notna(last_seen_dt) and last_seen_dt >= cutoff)
+                status = "\U0001F7E2 Online" if is_online else "\u26AA Offline"
+                if row["blocked"]:
+                    status = "\U0001F6AB Removed"
+
+                st.markdown(f"**{row['name'] or '(no name)'}**  \n{row['email']}")
+                st.caption(
+                    f"{status} \u2022 First seen {row['first_seen']} \u2022 "
+                    f"Last seen {row['last_seen']} \u2022 {row['visits']} visit(s)"
+                )
+                if row["blocked"]:
+                    if st.button("Restore access", key=f"restore_{row['email']}", use_container_width=True):
+                        _set_viewer_blocked(row["email"], False)
+                        st.rerun()
+                else:
+                    if st.button("\U0001F5D1\uFE0F Remove access", key=f"remove_{row['email']}", use_container_width=True):
+                        _set_viewer_blocked(row["email"], True)
+                        st.rerun()
+                st.markdown("---")
             st.caption(
-                "This lists every Google account that has ever opened this "
-                "dashboard. All of them are Viewers (read-only) except you."
+                f"'Online' means active within the last {ONLINE_WINDOW_MINUTES} minutes. "
+                "Names/emails are self-reported by each viewer, not verified."
             )
 
 
@@ -1073,24 +1200,19 @@ def render_sidebar():
     st.sidebar.title("\U0001F6F5 Logistics Control Panel")
     st.sidebar.caption(f"Connected to `{DB_PATH}`")
 
-    if is_admin():
-        st.sidebar.success(f"\U0001F511 Signed in as Admin\n\n{st.user.email}")
+    role = st.session_state.get("auth_role")
+    if role == "admin":
+        st.sidebar.success(f"\U0001F511 Signed in as Admin\n\n{st.session_state.get('auth_email', '')}")
     else:
-        st.sidebar.info(f"\U0001F441\uFE0F Signed in as Viewer (read-only)\n\n{st.user.email}")
+        name = st.session_state.get("auth_name", "")
+        email = st.session_state.get("auth_email", "")
+        st.sidebar.info(f"\U0001F441\uFE0F Signed in as Viewer (read-only)\n\n{name} \u2022 {email}")
 
-    col_switch, col_out = st.sidebar.columns(2)
-    with col_switch:
-        if st.button("\U0001F504 Switch account", use_container_width=True):
-            st.logout()
-    with col_out:
-        if st.button("Sign out", use_container_width=True):
-            st.logout()
-    st.sidebar.caption(
-        "'Switch account' signs you out of THIS dashboard. If Google "
-        "auto-picks the same account again, use your browser's own "
-        "Google account switcher (or an incognito window) to pick a "
-        "different one."
-    )
+    if st.sidebar.button("Sign out", use_container_width=True):
+        st.session_state.auth_role = None
+        st.session_state.auth_email = None
+        st.session_state.auth_name = None
+        st.rerun()
 
     if is_admin():
         render_hq_access_panel()
