@@ -23,12 +23,10 @@ sidebar to populate the database with realistic demo data for testing.
 ==============================================================================
 """
 
-import hashlib
 import json
 import os
 import random
 import re
-import secrets
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -227,26 +225,28 @@ def stat_cards(cards: list) -> None:
 
 
 # ==============================================================================
-# HQ AUTHENTICATION  (Admin = you, everyone else = read-only Viewer)
+# HQ AUTHENTICATION  -- real "Sign in with Google" (Admin = you, everyone
+# else who signs in with their OWN Google account = read-only Viewer)
 # ==============================================================================
-# A lightweight, self-contained login system: the FIRST person to open the
-# app sets up the one Admin account (their email + a password). That
-# password is never stored in plain text -- only a salted hash, saved to
-# a local file (hq_owner.json) that lives next to the database. Anyone
-# else opening the app can either sign in with that exact email+password
-# to get Admin (full edit) access, or continue as a Viewer, who can see
-# every tab but cannot upload files, seed/clear data, or change anything.
+# This uses Streamlit's built-in st.login()/st.user, which is a proper
+# OAuth 2.0 / OpenID Connect flow against Google -- clicking "Sign in with
+# Google" sends the person to accounts.google.com to sign in for real.
+# There is no emailed confirmation code (that's a different kind of login
+# flow); Google itself verifies the person's identity and redirects them
+# back here.
 #
-# IMPORTANT HONESTY NOTE (told to the user in the app itself too): this is
-# basic access control suitable for a trusted team on a private network --
-# it is NOT enterprise-grade security. There's no HTTPS encryption unless
-# you deploy behind something that provides it, and anyone with access to
-# hq_owner.json on disk could tamper with it. Don't reuse a sensitive
-# password here.
-
-
-def _hash_password(password: str, salt: str) -> str:
-    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+# SETUP REQUIRED (one-time, done by you -- see the README in this
+# package): you must create a Google OAuth Client ID in Google Cloud
+# Console and put its client_id/client_secret into a local
+# .streamlit/secrets.toml file. Streamlit reads that file automatically;
+# nothing in THIS code contains your credentials.
+#
+# The very FIRST Google account that ever signs in becomes the HQ Admin
+# automatically (that should be you). Everyone after that who signs in
+# with a DIFFERENT Google account is a Viewer -- they can see every tab
+# but cannot upload, edit, seed, or clear data. Every Google account that
+# has ever signed in is logged (email, name, first/last seen, visit
+# count) so you can see exactly who has access, in the sidebar.
 
 
 def _load_owner_config():
@@ -259,133 +259,145 @@ def _load_owner_config():
         return None
 
 
-def _save_owner_config(email: str, password: str) -> dict:
-    salt = secrets.token_hex(16)
-    config = {
-        "email": email.strip().lower(),
-        "salt": salt,
-        "password_hash": _hash_password(password, salt),
-    }
+def _save_owner_config(owner_email: str) -> dict:
+    config = {"owner_email": owner_email.strip().lower()}
     with open(OWNER_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f)
     return config
 
 
-def _verify_owner(email: str, password: str, config: dict) -> bool:
+def is_admin() -> bool:
+    """True only for the HQ owner's Google account -- use this to gate
+    anything that uploads, edits, seeds, or clears data."""
+    if not (hasattr(st, "user") and st.user.is_logged_in):
+        return False
+    config = _load_owner_config()
     if not config:
         return False
-    if email.strip().lower() != config.get("email", ""):
-        return False
-    return _hash_password(password, config.get("salt", "")) == config.get("password_hash", "")
+    return st.user.email.strip().lower() == config.get("owner_email", "")
 
 
-def is_admin() -> bool:
-    """True only for the signed-in HQ Admin -- use this to gate anything
-    that uploads, edits, seeds, or clears data."""
-    return st.session_state.get("auth_role") == "admin"
+def _record_access(email: str, name: str) -> None:
+    """Log every Google account that has ever signed in, so the Admin can
+    see exactly who has access to this dashboard."""
+    conn = get_connection()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS access_log (
+            email TEXT PRIMARY KEY,
+            name TEXT,
+            first_seen TEXT,
+            last_seen TEXT,
+            visit_count INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    email = email.strip().lower()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    existing = conn.execute("SELECT visit_count FROM access_log WHERE email = ?", (email,)).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE access_log SET name = ?, last_seen = ?, visit_count = visit_count + 1 WHERE email = ?",
+            (name, now, email),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO access_log (email, name, first_seen, last_seen, visit_count) VALUES (?, ?, ?, ?, 1)",
+            (email, name, now, now),
+        )
+    conn.commit()
+    conn.close()
 
 
 def render_auth_gate() -> bool:
-    """Shows first-run Admin setup (once, if no owner account exists yet),
-    then a sign-in / continue-as-viewer screen on every subsequent run
-    until someone picks one. Returns True once it's OK to show the actual
+    """Shows a 'Sign in with Google' screen until someone is authenticated
+    via a real Google account. Returns True once it's OK to show the
     dashboard."""
-    if "auth_role" not in st.session_state:
-        st.session_state.auth_role = None
-        st.session_state.auth_email = None
-
-    if st.session_state.auth_role in ("admin", "viewer"):
-        return True
-
-    st.markdown(
-        "<h1 style='text-align:center; margin-bottom:0;'>\U0001F3E2 HQ</h1>"
-        "<p style='text-align:center; opacity:0.65; margin-top:0;'>"
-        "Delivery Logistics &amp; Payroll Dashboard</p>",
-        unsafe_allow_html=True,
-    )
-
-    config = _load_owner_config()
-
-    if config is None:
-        st.info(
-            "\U0001F510 **First-time setup** -- create the HQ Admin account. "
-            "Only this account will be able to upload files, seed/clear data, "
-            "or make any changes. Everyone else who opens this app can view "
-            "the dashboards but not edit anything."
+    if not hasattr(st, "user"):
+        st.error(
+            "This Streamlit version doesn't support built-in login. "
+            "Please update it: `pip install -U streamlit`"
         )
-        st.caption(
-            "Note: this is basic password protection meant for a trusted "
-            "team, not enterprise-grade security -- don't reuse a sensitive "
-            "password here."
-        )
-        with st.form("hq_setup_form"):
-            email = st.text_input("Your email (this becomes the HQ Admin login)")
-            pw1 = st.text_input("Choose a password", type="password")
-            pw2 = st.text_input("Confirm password", type="password")
-            submitted = st.form_submit_button("Create Admin Account", type="primary")
-        if submitted:
-            if not email or "@" not in email:
-                st.error("Please enter a valid email address.")
-            elif len(pw1) < 6:
-                st.error("Password should be at least 6 characters.")
-            elif pw1 != pw2:
-                st.error("Passwords don't match.")
-            else:
-                _save_owner_config(email, pw1)
-                st.session_state.auth_role = "admin"
-                st.session_state.auth_email = email.strip().lower()
-                st.success("Admin account created!")
-                st.rerun()
         return False
 
-    tab_admin, tab_viewer = st.tabs(["\U0001F511 Admin Sign In", "\U0001F441\uFE0F Continue as Viewer"])
-
-    with tab_admin:
-        with st.form("hq_login_form"):
-            email = st.text_input("Email")
-            pw = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Sign In", type="primary")
-        if submitted:
-            if _verify_owner(email, pw, config):
-                st.session_state.auth_role = "admin"
-                st.session_state.auth_email = config["email"]
-                st.rerun()
-            else:
-                st.error("Incorrect email or password.")
-
-    with tab_viewer:
-        st.write(
-            "Viewers can see every dashboard, report, and rider lookup, "
-            "but cannot upload files, seed demo data, clear data, or make "
-            "any changes."
+    if not st.user.is_logged_in:
+        st.markdown(
+            "<h1 style='text-align:center; margin-bottom:0;'>\U0001F3E2 HQ</h1>"
+            "<p style='text-align:center; opacity:0.65; margin-top:0;'>"
+            "Delivery Logistics &amp; Payroll Dashboard</p>",
+            unsafe_allow_html=True,
         )
-        if st.button("Continue as Viewer", use_container_width=True):
-            st.session_state.auth_role = "viewer"
-            st.session_state.auth_email = None
-            st.rerun()
+        _, mid, _ = st.columns([1, 1, 1])
+        with mid:
+            st.write("")
+            if st.button("\U0001F510 Sign in with Google", type="primary", use_container_width=True):
+                st.login()
+            st.caption(
+                "You'll be sent to Google's real sign-in page. The first "
+                "Google account to ever sign in becomes the HQ Admin; "
+                "everyone else who signs in with their own Google account "
+                "is a read-only Viewer."
+            )
+        return False
 
-    return False
+    config = _load_owner_config()
+    if config is None:
+        _save_owner_config(st.user.email)
+
+    _record_access(st.user.email, st.user.get("name", ""))
+    return True
 
 
 def render_hq_banner():
-    """Small centered strip at the very top of the dashboard: HQ branding,
-    the Admin's email, and who is currently signed in."""
+    """HQ branding + the signed-in person's email, right-aligned at the
+    top of the dashboard."""
     config = _load_owner_config()
-    owner_email = config["email"] if config else ""
-    role = st.session_state.get("auth_role")
-    role_label = "Admin (edit access)" if role == "admin" else "Viewer (read-only)"
+    owner_email = config["owner_email"] if config else ""
+    role_label = "Admin (edit access)" if is_admin() else "Viewer (read-only)"
     st.markdown(
         f"""
-        <div style="text-align:center; padding:4px 0 10px 0;">
-          <span style="font-weight:900; letter-spacing:3px; font-size:15px;">\U0001F3E2 HQ</span>
-          <span style="opacity:0.45;"> &nbsp;|&nbsp; </span>
-          <span style="opacity:0.85; font-size:13px;">{owner_email}</span>
-          <span style="opacity:0.45;"> &nbsp;|&nbsp; </span>
-          <span style="opacity:0.75; font-size:13px;">Signed in as {role_label}</span>
+        <div style="display:flex; justify-content:flex-end; align-items:center;
+                    gap:8px; padding:2px 4px 8px 0; flex-wrap:wrap;">
+          <span style="font-weight:900; letter-spacing:2px; font-size:14px;">\U0001F3E2 HQ</span>
+          <span style="opacity:0.4;">|</span>
+          <span style="opacity:0.85; font-size:12.5px;">{st.user.email}</span>
+          <span style="opacity:0.4;">|</span>
+          <span style="opacity:0.7; font-size:12.5px;">{role_label}</span>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    _ = owner_email  # (kept for the sidebar's "who has access" panel, not shown here)
+
+
+def render_hq_access_panel():
+    """Admin-only sidebar panel listing every Google account that has ever
+    signed in -- answers 'kis kis ke paas dashboard access hai'."""
+    conn = get_connection()
+    try:
+        df = pd.read_sql_query(
+            "SELECT email, name, first_seen, last_seen, visit_count FROM access_log ORDER BY last_seen DESC",
+            conn,
+        )
+    except Exception:  # noqa: BLE001 - table doesn't exist yet (no one but you has ever logged in)
+        df = pd.DataFrame(columns=["email", "name", "first_seen", "last_seen", "visit_count"])
+    conn.close()
+
+    with st.sidebar.expander(f"\U0001F465 Who has access ({len(df)})", expanded=False):
+        if df.empty:
+            st.caption("No sign-ins recorded yet.")
+        else:
+            st.dataframe(
+                df.rename(columns={
+                    "email": "Email", "name": "Name", "first_seen": "First seen",
+                    "last_seen": "Last seen", "visit_count": "Visits",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption(
+                "This lists every Google account that has ever opened this "
+                "dashboard. All of them are Viewers (read-only) except you."
+            )
 
 
 def render_header(filters: dict):
@@ -710,6 +722,18 @@ def init_db() -> None:
             valid_days_in_month   INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (driver_id) REFERENCES drivers(driver_id),
             UNIQUE (driver_id, month_year)
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS access_log (
+            email TEXT PRIMARY KEY,
+            name TEXT,
+            first_seen TEXT,
+            last_seen TEXT,
+            visit_count INTEGER NOT NULL DEFAULT 1
         );
         """
     )
@@ -1049,17 +1073,28 @@ def render_sidebar():
     st.sidebar.title("\U0001F6F5 Logistics Control Panel")
     st.sidebar.caption(f"Connected to `{DB_PATH}`")
 
-    role = st.session_state.get("auth_role")
-    if role == "admin":
-        st.sidebar.success(f"\U0001F511 Signed in as Admin\n\n{st.session_state.get('auth_email', '')}")
+    if is_admin():
+        st.sidebar.success(f"\U0001F511 Signed in as Admin\n\n{st.user.email}")
     else:
-        st.sidebar.info("\U0001F441\uFE0F Viewing as Viewer (read-only)")
-    if st.sidebar.button("Sign out", use_container_width=True):
-        st.session_state.auth_role = None
-        st.session_state.auth_email = None
-        st.rerun()
+        st.sidebar.info(f"\U0001F441\uFE0F Signed in as Viewer (read-only)\n\n{st.user.email}")
+
+    col_switch, col_out = st.sidebar.columns(2)
+    with col_switch:
+        if st.button("\U0001F504 Switch account", use_container_width=True):
+            st.logout()
+    with col_out:
+        if st.button("Sign out", use_container_width=True):
+            st.logout()
+    st.sidebar.caption(
+        "'Switch account' signs you out of THIS dashboard. If Google "
+        "auto-picks the same account again, use your browser's own "
+        "Google account switcher (or an incognito window) to pick a "
+        "different one."
+    )
 
     if is_admin():
+        render_hq_access_panel()
+
         st.sidebar.markdown("### \U0001F331 Demo Data")
         if st.sidebar.button("Seed Sample Data", use_container_width=True):
             seed_sample_data()
