@@ -28,8 +28,10 @@ import json
 import os
 import random
 import re
+import smtplib
 import sqlite3
 from datetime import datetime, timedelta
+from email.mime.text import MIMEText
 
 import pandas as pd
 import streamlit as st
@@ -299,50 +301,112 @@ def _ensure_viewer_table(conn) -> None:
             first_seen TEXT,
             last_seen  TEXT,
             visits     INTEGER NOT NULL DEFAULT 1,
-            blocked    INTEGER NOT NULL DEFAULT 0
+            status     TEXT NOT NULL DEFAULT 'pending'
         )
         """
     )
+    # Migrate an older version of this table that only had a boolean
+    # "blocked" column -- anyone already granted access under the old
+    # auto-approve system counts as already 'approved', not 'pending'.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(viewer_log)").fetchall()]
+    if "blocked" in cols and "status" not in cols:
+        conn.execute("ALTER TABLE viewer_log ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+        conn.execute("UPDATE viewer_log SET status = CASE WHEN blocked = 1 THEN 'revoked' ELSE 'approved' END")
+    elif "status" not in cols:
+        conn.execute("ALTER TABLE viewer_log ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
 
 
-def _is_viewer_blocked(email: str) -> bool:
+def _get_viewer_status(email: str):
+    """Returns 'pending' / 'approved' / 'revoked', or None if this email
+    has never requested access before."""
     conn = get_connection()
     _ensure_viewer_table(conn)
-    row = conn.execute("SELECT blocked FROM viewer_log WHERE email = ?", (email.strip().lower(),)).fetchone()
+    row = conn.execute("SELECT status FROM viewer_log WHERE email = ?", (email.strip().lower(),)).fetchone()
     conn.close()
-    return bool(row and row[0])
+    return row[0] if row else None
 
 
-def _record_viewer_visit(email: str, name: str) -> None:
-    """Log this viewer's visit (insert new, or refresh name/last_seen and
-    bump their visit count) -- also silently keeps their session 'online'
-    on every rerun while they're using the dashboard."""
+def _record_viewer_request(email: str, name: str) -> bool:
+    """Log a viewer's access request (or a returning approved viewer's
+    visit). Returns True if this is a BRAND NEW request (so the caller
+    knows whether to email the Admin) -- a returning viewer's status is
+    left untouched, only their name/last_seen/visits are refreshed."""
     conn = get_connection()
     _ensure_viewer_table(conn)
     email = email.strip().lower()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     existing = conn.execute("SELECT visits FROM viewer_log WHERE email = ?", (email,)).fetchone()
-    if existing:
+    is_new = existing is None
+    if is_new:
+        conn.execute(
+            "INSERT INTO viewer_log (email, name, first_seen, last_seen, visits, status) "
+            "VALUES (?, ?, ?, ?, 1, 'pending')",
+            (email, name, now, now),
+        )
+    else:
         conn.execute(
             "UPDATE viewer_log SET name = ?, last_seen = ?, visits = visits + 1 WHERE email = ?",
             (name, now, email),
         )
-    else:
-        conn.execute(
-            "INSERT INTO viewer_log (email, name, first_seen, last_seen, visits, blocked) "
-            "VALUES (?, ?, ?, ?, 1, 0)",
-            (email, name, now, now),
-        )
     conn.commit()
     conn.close()
+    return is_new
 
 
-def _set_viewer_blocked(email: str, blocked: bool) -> None:
+def _touch_viewer_visit(email: str, name: str) -> None:
+    """Refresh last_seen/visits for an ALREADY-approved viewer, without
+    touching their status."""
     conn = get_connection()
     _ensure_viewer_table(conn)
-    conn.execute("UPDATE viewer_log SET blocked = ? WHERE email = ?", (1 if blocked else 0, email.strip().lower()))
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        "UPDATE viewer_log SET name = ?, last_seen = ?, visits = visits + 1 WHERE email = ?",
+        (name, now, email.strip().lower()),
+    )
     conn.commit()
     conn.close()
+
+
+def _set_viewer_status(email: str, status: str) -> None:
+    conn = get_connection()
+    _ensure_viewer_table(conn)
+    conn.execute("UPDATE viewer_log SET status = ? WHERE email = ?", (status, email.strip().lower()))
+    conn.commit()
+    conn.close()
+
+
+def _send_access_request_email(viewer_name: str, viewer_email: str) -> bool:
+    """Emails the HQ Admin when someone new requests access. Reads Gmail
+    sender credentials from Streamlit secrets ([email] address /
+    app_password) -- if those aren't configured, this silently does
+    nothing (the request still shows up in-app either way, so nothing is
+    lost, just no email alert). Returns True only if the email was
+    actually sent."""
+    try:
+        email_cfg = st.secrets.get("email", {})
+        sender = email_cfg.get("address")
+        app_password = email_cfg.get("app_password")
+        owner_config = _load_owner_config()
+        admin_email = owner_config["email"] if owner_config else None
+        if not (sender and app_password and admin_email):
+            return False
+
+        msg = MIMEText(
+            f"{viewer_name} ({viewer_email}) just requested access to your "
+            f"HQ dashboard.\n\n"
+            f"Open the dashboard, check the sidebar's 'Access requests' "
+            f"panel, and Approve or Deny them."
+        )
+        msg["Subject"] = "HQ Dashboard: new access request"
+        msg["From"] = sender
+        msg["To"] = admin_email
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
+            server.login(sender, app_password)
+            server.sendmail(sender, [admin_email], msg.as_string())
+        return True
+    except Exception:  # noqa: BLE001 - never let an email problem break the request flow
+        return False
 
 
 def render_auth_gate() -> bool:
@@ -357,12 +421,28 @@ def render_auth_gate() -> bool:
     if st.session_state.auth_role == "admin":
         return True
     if st.session_state.auth_role == "viewer":
-        if _is_viewer_blocked(st.session_state.auth_email):
-            st.session_state.auth_role = None
-            st.error("Your access to this dashboard has been removed by the HQ Admin.")
+        status = _get_viewer_status(st.session_state.auth_email)
+        if status == "approved":
+            _touch_viewer_visit(st.session_state.auth_email, st.session_state.auth_name)
+            return True
+        if status == "pending":
+            st.markdown(
+                "<h1 style='text-align:center; margin-bottom:0;'>\U0001F3E2 HQ</h1>",
+                unsafe_allow_html=True,
+            )
+            st.info(
+                f"\u23F3 **Your access request is waiting for approval.**\n\n"
+                f"{st.session_state.auth_name} ({st.session_state.auth_email}) "
+                f"-- the HQ Admin has been notified. Check back shortly, or "
+                f"press the button below to check again."
+            )
+            if st.button("\U0001F504 Check again"):
+                st.rerun()
             return False
-        _record_viewer_visit(st.session_state.auth_email, st.session_state.auth_name)
-        return True
+        # status is "revoked", or the record vanished somehow
+        st.session_state.auth_role = None
+        st.error("Your access to this dashboard has been removed by the HQ Admin.")
+        return False
 
     st.markdown(
         "<h1 style='text-align:center; margin-bottom:0;'>\U0001F3E2 HQ</h1>"
@@ -405,7 +485,7 @@ def render_auth_gate() -> bool:
                 st.rerun()
         return False
 
-    tab_admin, tab_viewer = st.tabs(["\U0001F511 Admin Sign In", "\U0001F441\uFE0F Continue as Viewer"])
+    tab_admin, tab_viewer = st.tabs(["\U0001F511 Admin Sign In", "\U0001F64B Request Access"])
 
     with tab_admin:
         with st.form("hq_login_form"):
@@ -422,26 +502,29 @@ def render_auth_gate() -> bool:
 
     with tab_viewer:
         st.write(
-            "Viewers can see every dashboard, report, and rider lookup, "
-            "but cannot upload files, seed demo data, clear data, or make "
-            "any changes."
+            "Approved viewers can see every dashboard, report, and rider "
+            "lookup, but cannot upload files, seed demo data, clear data, "
+            "or make any changes."
         )
         st.caption(
-            "Enter your name and email so the HQ Admin can see who has "
-            "viewed this dashboard."
+            "Your request goes to the HQ Admin for approval -- you won't "
+            "see the dashboard until they approve you."
         )
         with st.form("hq_viewer_form"):
             v_name = st.text_input("Your name")
             v_email = st.text_input("Your email")
-            submitted = st.form_submit_button("Continue as Viewer", use_container_width=True)
+            submitted = st.form_submit_button("Request Access", use_container_width=True)
         if submitted:
             if not v_name.strip():
                 st.error("Please enter your name.")
             elif not v_email or "@" not in v_email:
                 st.error("Please enter a valid email address.")
-            elif _is_viewer_blocked(v_email):
+            elif _get_viewer_status(v_email) == "revoked":
                 st.error("This email's access has been removed by the HQ Admin.")
             else:
+                is_new_request = _record_viewer_request(v_email, v_name.strip())
+                if is_new_request:
+                    _send_access_request_email(v_name.strip(), v_email.strip().lower())
                 st.session_state.auth_role = "viewer"
                 st.session_state.auth_email = v_email.strip().lower()
                 st.session_state.auth_name = v_name.strip()
@@ -478,53 +561,78 @@ def render_hq_banner():
 
 
 def render_hq_access_panel():
-    """Admin-only sidebar panel listing every viewer who has ever
-    identified themselves, whether they look online right now, and a
-    button to remove (or restore) their access."""
+    """Admin-only sidebar panel: pending access requests needing a
+    decision, then everyone already approved (with online status and a
+    Remove button), then anyone previously revoked (with a Restore
+    button)."""
     conn = get_connection()
     _ensure_viewer_table(conn)
     df = pd.read_sql_query(
-        "SELECT email, name, first_seen, last_seen, visits, blocked FROM viewer_log ORDER BY last_seen DESC",
+        "SELECT email, name, first_seen, last_seen, visits, status FROM viewer_log ORDER BY last_seen DESC",
         conn,
     )
     conn.close()
 
-    online_count = 0
-    if not df.empty:
-        cutoff = datetime.now() - timedelta(minutes=ONLINE_WINDOW_MINUTES)
-        last_seen_dt = pd.to_datetime(df["last_seen"], errors="coerce")
-        online_count = int(((last_seen_dt >= cutoff) & (df["blocked"] == 0)).sum())
+    pending_df = df[df["status"] == "pending"]
+    approved_df = df[df["status"] == "approved"]
+    revoked_df = df[df["status"] == "revoked"]
 
-    with st.sidebar.expander(f"\U0001F465 Who has viewed ({len(df)}) \u2022 \U0001F7E2 {online_count} online", expanded=False):
-        if df.empty:
-            st.caption("No viewers have identified themselves yet.")
+    online_count = 0
+    if not approved_df.empty:
+        cutoff = datetime.now() - timedelta(minutes=ONLINE_WINDOW_MINUTES)
+        last_seen_dt = pd.to_datetime(approved_df["last_seen"], errors="coerce")
+        online_count = int((last_seen_dt >= cutoff).sum())
+
+    if not pending_df.empty:
+        with st.sidebar.expander(f"\U0001F64B Access requests ({len(pending_df)})", expanded=True):
+            for _, row in pending_df.iterrows():
+                st.markdown(f"**{row['name'] or '(no name)'}**  \n{row['email']}")
+                st.caption(f"Requested {row['first_seen']}")
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("\u2705 Approve", key=f"approve_{row['email']}", use_container_width=True):
+                        _set_viewer_status(row["email"], "approved")
+                        st.rerun()
+                with c2:
+                    if st.button("\u274C Deny", key=f"deny_{row['email']}", use_container_width=True):
+                        _set_viewer_status(row["email"], "revoked")
+                        st.rerun()
+                st.markdown("---")
+
+    with st.sidebar.expander(
+        f"\U0001F465 Who has access ({len(approved_df)}) \u2022 \U0001F7E2 {online_count} online", expanded=False
+    ):
+        if approved_df.empty:
+            st.caption("No approved viewers yet.")
         else:
             cutoff = datetime.now() - timedelta(minutes=ONLINE_WINDOW_MINUTES)
-            for _, row in df.iterrows():
+            for _, row in approved_df.iterrows():
                 last_seen_dt = pd.to_datetime(row["last_seen"], errors="coerce")
-                is_online = bool(row["blocked"] == 0 and pd.notna(last_seen_dt) and last_seen_dt >= cutoff)
-                status = "\U0001F7E2 Online" if is_online else "\u26AA Offline"
-                if row["blocked"]:
-                    status = "\U0001F6AB Removed"
+                is_online = bool(pd.notna(last_seen_dt) and last_seen_dt >= cutoff)
+                status_label = "\U0001F7E2 Online" if is_online else "\u26AA Offline"
 
                 st.markdown(f"**{row['name'] or '(no name)'}**  \n{row['email']}")
                 st.caption(
-                    f"{status} \u2022 First seen {row['first_seen']} \u2022 "
+                    f"{status_label} \u2022 First seen {row['first_seen']} \u2022 "
                     f"Last seen {row['last_seen']} \u2022 {row['visits']} visit(s)"
                 )
-                if row["blocked"]:
-                    if st.button("Restore access", key=f"restore_{row['email']}", use_container_width=True):
-                        _set_viewer_blocked(row["email"], False)
-                        st.rerun()
-                else:
-                    if st.button("\U0001F5D1\uFE0F Remove access", key=f"remove_{row['email']}", use_container_width=True):
-                        _set_viewer_blocked(row["email"], True)
-                        st.rerun()
+                if st.button("\U0001F5D1\uFE0F Remove access", key=f"remove_{row['email']}", use_container_width=True):
+                    _set_viewer_status(row["email"], "revoked")
+                    st.rerun()
                 st.markdown("---")
             st.caption(
                 f"'Online' means active within the last {ONLINE_WINDOW_MINUTES} minutes. "
-                "Names/emails are self-reported by each viewer, not verified."
+                "Names/emails are self-reported, not verified."
             )
+
+    if not revoked_df.empty:
+        with st.sidebar.expander(f"\U0001F6AB Removed / denied ({len(revoked_df)})", expanded=False):
+            for _, row in revoked_df.iterrows():
+                st.markdown(f"**{row['name'] or '(no name)'}**  \n{row['email']}")
+                if st.button("\u21A9\uFE0F Restore access", key=f"restore_{row['email']}", use_container_width=True):
+                    _set_viewer_status(row["email"], "approved")
+                    st.rerun()
+                st.markdown("---")
 
 
 def render_header(filters: dict):
