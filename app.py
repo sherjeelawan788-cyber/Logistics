@@ -1541,23 +1541,35 @@ def render_financials(filters: dict):
     month_df = apply_filters(merged, filters, month_scoped=True)
     month_df = month_df[month_df["log_id"].notna()]
 
-    total_orders = int(month_df["total_orders"].sum())
-    total_cancelled = int(month_df["cancelled_orders"].sum())
     total_gross = float(month_df["gross_salary"].sum())
     total_deductions = float(month_df["total_deductions"].sum())
     total_net = float(month_df["net_salary"].sum())
     total_pending = float(month_df["pending_salary"].sum())
 
-    completion_rate = f"{(1 - total_cancelled / total_orders) * 100:.1f}%" if total_orders else "N/A"
+    conn = get_connection()
+    _ensure_salary_summary_table(conn)
+    summary_row = conn.execute(
+        "SELECT total_payable, tax_amount, invoice_amount FROM salary_summary WHERE month_year = ?",
+        (filters["month"],),
+    ).fetchone()
+    conn.close()
 
-    stat_cards([
-        {"icon": "\U0001F4E6", "label": "Total Orders", "value": f"{total_orders:,}",
-         "tip": "All completed orders this month", "variant": "a"},
-        {"icon": "\u274C", "label": "Cancelled Orders", "value": f"{total_cancelled:,}",
-         "tip": "Orders cancelled this month", "variant": "c"},
-        {"icon": "\U0001F4CA", "label": "Completion Rate", "value": completion_rate,
-         "tip": "Share of orders NOT cancelled", "variant": "b"},
-    ])
+    if summary_row and (summary_row[0] is not None or summary_row[1] is not None):
+        company_total, tax_amount, invoice_amount = summary_row
+        stat_cards([
+            {"icon": "\U0001F4B0", "label": "Total Money Received", "value": f"Rs {(company_total or 0):,.2f}",
+             "tip": "Company-level total payable amount for this billing cycle", "variant": "a"},
+            {"icon": "\U0001F9FE", "label": "Tax Amount", "value": f"Rs {(tax_amount or 0):,.2f}",
+             "tip": "Tax amount for this billing cycle, from the salary summary sheet", "variant": "c"},
+            {"icon": "\U0001F4C4", "label": "Invoice Amount", "value": f"Rs {(invoice_amount or 0):,.2f}",
+             "tip": "Invoiced amount for this billing cycle", "variant": "b"},
+        ])
+    else:
+        st.caption(
+            "\u2139\uFE0F No company-level salary summary (Total Money Received / "
+            "Tax Amount) found for this month yet -- upload it from "
+            "**Upload Monthly Data \u2192 Salary Data**."
+        )
 
     stat_cards([
         {"icon": "\U0001F4B5", "label": "Gross Salary", "value": f"Rs {total_gross:,.0f}",
@@ -1738,7 +1750,7 @@ def _clean_number_value(v, as_int: bool = False):
         return 0 if as_int else 0.0
     negative = s.startswith("(") and s.endswith(")")
     s = s.strip("()")
-    for ch in ["Rs", "SR", "PKR", "$", ",", "%", " "]:
+    for ch in ["Rs", "SR", "SAR", "PKR", "$", ",", "%", " "]:
         s = s.replace(ch, "")
     try:
         num = float(s)
@@ -2090,6 +2102,248 @@ def _row_is_summary(raw_row) -> bool:
         if s in SUMMARY_ROW_TOKENS or "grand total" in s:
             return True
     return False
+
+
+# ==============================================================================
+# SALARY WORKBOOK UPLOAD  (separate from the roster/orders/validity upload)
+# ==============================================================================
+# The monthly salary export (e.g. "Feb_salary_main_sheet.xlsx") has its own
+# distinct layout: a per-rider sheet (headers change slightly month to
+# month -- "JAN SALARY " vs "riderDetail") with columns like Courier ID,
+# Total payable amount, TOTAL DEDUCTION, FINAL SALARY, PENDING; and a
+# one-row company-summary sheet ("partnerDetail") with Tax Amount and
+# Total payable amount at the company level. This uses EXACT column-name
+# matching only (no fuzzy substring fallback) -- "Deduction" (one line
+# item) and "TOTAL DEDUCTION" (the actual total) are both real columns in
+# this file, and a substring match would confuse the two.
+
+SALARY_DETAIL_ALIASES = {
+    "driver_id": ["courier id"],
+    "driver_name": ["courier name"],
+    "billing_cycle": ["billing cycle"],
+    "gross_amount": ["total payable amount", "total salary"],
+    "total_deductions": ["total deduction"],
+    "final_salary": ["final salary"],
+    "pending_amount": ["pending", "pend"],
+}
+
+SALARY_SUMMARY_ALIASES = {
+    "billing_cycle": ["billing cycle"],
+    "tax_amount": ["tax amount"],
+    "total_payable": ["total payable amount"],
+    "invoice_amount": ["invoice amount"],
+}
+
+
+def _guess_column_exact(columns: list, aliases: list) -> str:
+    """Like _guess_column, but EXACT normalized match only -- no substring
+    fallback. Use this whenever similarly-named columns in the same sheet
+    (e.g. 'Deduction' vs 'TOTAL DEDUCTION') could otherwise be confused."""
+    normed = {c: _normalize_header(c) for c in columns}
+    for col, norm in normed.items():
+        if norm in aliases:
+            return col
+    return NONE_OPTION
+
+
+def _ensure_salary_summary_table(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS salary_summary (
+            month_year     TEXT PRIMARY KEY,
+            total_payable  REAL,
+            tax_amount     REAL,
+            invoice_amount REAL
+        )
+        """
+    )
+
+
+def _classify_salary_sheet(df: pd.DataFrame) -> str:
+    """Returns 'salary_detail' (per-rider), 'salary_summary' (one-row
+    company total), or 'unrecognized'."""
+    cols = list(df.columns)
+    has_courier_id = _guess_column_exact(cols, SALARY_DETAIL_ALIASES["driver_id"]) != NONE_OPTION
+    has_final_salary = _guess_column_exact(cols, SALARY_DETAIL_ALIASES["final_salary"]) != NONE_OPTION
+    has_total_ded = _guess_column_exact(cols, SALARY_DETAIL_ALIASES["total_deductions"]) != NONE_OPTION
+    has_tax = _guess_column_exact(cols, SALARY_SUMMARY_ALIASES["tax_amount"]) != NONE_OPTION
+
+    if has_tax and not has_courier_id:
+        return "salary_summary"
+    if has_courier_id and (has_final_salary or has_total_ded):
+        return "salary_detail"
+    return "unrecognized"
+
+
+def _extract_salary_detail(df: pd.DataFrame, default_month: str):
+    """Returns (rows, id_to_name) -- rows is a list of per-rider salary
+    update dicts ready for merge_monthly_log."""
+    cols = list(df.columns)
+    id_col = _guess_column_exact(cols, SALARY_DETAIL_ALIASES["driver_id"])
+    name_col = _guess_column_exact(cols, SALARY_DETAIL_ALIASES["driver_name"])
+    billing_col = _guess_column_exact(cols, SALARY_DETAIL_ALIASES["billing_cycle"])
+    gross_col = _guess_column_exact(cols, SALARY_DETAIL_ALIASES["gross_amount"])
+    ded_col = _guess_column_exact(cols, SALARY_DETAIL_ALIASES["total_deductions"])
+    final_col = _guess_column_exact(cols, SALARY_DETAIL_ALIASES["final_salary"])
+    pending_col = _guess_column_exact(cols, SALARY_DETAIL_ALIASES["pending_amount"])
+
+    if id_col == NONE_OPTION:
+        return [], {}
+
+    rows = []
+    id_to_name = {}
+    for _, raw in df.iterrows():
+        if _row_is_summary(raw):
+            continue
+        driver_id = _clean_id_value(raw[id_col])
+        if not driver_id:
+            continue
+
+        month_year = default_month
+        if billing_col != NONE_OPTION and not pd.isna(raw[billing_col]):
+            parsed = _clean_month_value(raw[billing_col])
+            if parsed:
+                month_year = parsed
+
+        name = None
+        if name_col != NONE_OPTION and not pd.isna(raw[name_col]):
+            name = str(raw[name_col]).strip()
+            if name:
+                id_to_name[driver_id] = name
+
+        rows.append({
+            "driver_id": driver_id,
+            "month_year": month_year,
+            "gross_salary": _clean_number_value(raw[gross_col]) if gross_col != NONE_OPTION and not pd.isna(raw[gross_col]) else None,
+            "total_deductions": _clean_number_value(raw[ded_col]) if ded_col != NONE_OPTION and not pd.isna(raw[ded_col]) else None,
+            "net_salary": _clean_number_value(raw[final_col]) if final_col != NONE_OPTION and not pd.isna(raw[final_col]) else None,
+            "pending_salary": _clean_number_value(raw[pending_col]) if pending_col != NONE_OPTION and not pd.isna(raw[pending_col]) else None,
+        })
+    return rows, id_to_name
+
+
+def _extract_salary_summary(df: pd.DataFrame, default_month: str) -> list:
+    cols = list(df.columns)
+    billing_col = _guess_column_exact(cols, SALARY_SUMMARY_ALIASES["billing_cycle"])
+    tax_col = _guess_column_exact(cols, SALARY_SUMMARY_ALIASES["tax_amount"])
+    payable_col = _guess_column_exact(cols, SALARY_SUMMARY_ALIASES["total_payable"])
+    invoice_col = _guess_column_exact(cols, SALARY_SUMMARY_ALIASES["invoice_amount"])
+
+    records = []
+    for _, raw in df.iterrows():
+        if _row_is_summary(raw):
+            continue
+        month_year = default_month
+        if billing_col != NONE_OPTION and not pd.isna(raw[billing_col]):
+            parsed = _clean_month_value(raw[billing_col])
+            if parsed:
+                month_year = parsed
+        records.append({
+            "month_year": month_year,
+            "tax_amount": _clean_number_value(raw[tax_col]) if tax_col != NONE_OPTION and not pd.isna(raw[tax_col]) else None,
+            "total_payable": _clean_number_value(raw[payable_col]) if payable_col != NONE_OPTION and not pd.isna(raw[payable_col]) else None,
+            "invoice_amount": _clean_number_value(raw[invoice_col]) if invoice_col != NONE_OPTION and not pd.isna(raw[invoice_col]) else None,
+        })
+    return records
+
+
+def process_salary_workbook(uploaded_file, default_month: str) -> dict:
+    """Reads every sheet, classifies each as per-rider salary detail,
+    company-level summary, or unrecognized, and merges everything found
+    into monthly_logs (gross_salary/total_deductions/net_salary/
+    pending_salary) plus the salary_summary table for company totals."""
+    xls = pd.ExcelFile(uploaded_file)
+
+    sheet_report = []
+    detail_rows = []
+    id_to_name = {}
+    summary_records = []
+
+    for sheet_name in xls.sheet_names:
+        try:
+            df, _hdr = _read_excel_smart(uploaded_file, sheet_name)
+        except Exception as exc:  # noqa: BLE001
+            sheet_report.append((sheet_name, f"error reading sheet: {exc}", 0))
+            continue
+
+        df = df.dropna(axis=0, how="all").reset_index(drop=True)
+        df.columns = [str(c).strip() for c in df.columns]
+        if df.empty:
+            sheet_report.append((sheet_name, "empty", 0))
+            continue
+
+        kind = _classify_salary_sheet(df)
+        sheet_report.append((sheet_name, kind, len(df)))
+
+        if kind == "salary_detail":
+            rows, names = _extract_salary_detail(df, default_month)
+            detail_rows.extend(rows)
+            id_to_name.update(names)
+        elif kind == "salary_summary":
+            summary_records.extend(_extract_salary_summary(df, default_month))
+
+    conn = get_connection()
+    all_drivers_df = load_drivers()
+    known_driver_ids = set(all_drivers_df["driver_id"])
+    name_to_id = dict(zip(all_drivers_df["driver_name"].str.strip().str.upper(), all_drivers_df["driver_id"]))
+
+    riders_updated = set()
+    placeholders_created = 0
+    for row in detail_rows:
+        driver_id = row["driver_id"]
+        if driver_id not in known_driver_ids:
+            name = id_to_name.get(driver_id)
+            matched = _fuzzy_match_name_to_id(name_to_id, name) if name else None
+            if matched:
+                driver_id = matched
+            else:
+                upsert_driver(
+                    conn,
+                    {
+                        "driver_id": driver_id,
+                        "driver_name": name or f"Unknown Rider ({driver_id})",
+                        "status": "Active",
+                    },
+                )
+                known_driver_ids.add(driver_id)
+                placeholders_created += 1
+
+        merge_monthly_log(
+            conn,
+            driver_id,
+            row["month_year"],
+            {
+                "gross_salary": row["gross_salary"],
+                "total_deductions": row["total_deductions"],
+                "net_salary": row["net_salary"],
+                "pending_salary": row["pending_salary"],
+            },
+        )
+        riders_updated.add(driver_id)
+
+    _ensure_salary_summary_table(conn)
+    for rec in summary_records:
+        conn.execute(
+            """
+            INSERT INTO salary_summary (month_year, total_payable, tax_amount, invoice_amount)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(month_year) DO UPDATE SET
+                total_payable  = COALESCE(excluded.total_payable, salary_summary.total_payable),
+                tax_amount     = COALESCE(excluded.tax_amount, salary_summary.tax_amount),
+                invoice_amount = COALESCE(excluded.invoice_amount, salary_summary.invoice_amount)
+            """,
+            (rec["month_year"], rec["total_payable"], rec["tax_amount"], rec["invoice_amount"]),
+        )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "sheet_report": sheet_report,
+        "riders_updated": len(riders_updated),
+        "placeholders_created": placeholders_created,
+        "summary_written": len(summary_records),
+    }
 
 
 def _day_number_columns(columns) -> list:
@@ -2643,6 +2897,14 @@ def render_upload_tab():
         )
         return
 
+    tab_ops, tab_salary = st.tabs(["\U0001F4E4 Roster / Orders / Validity", "\U0001F4B0 Salary Data"])
+    with tab_ops:
+        _render_operations_upload()
+    with tab_salary:
+        _render_salary_upload()
+
+
+def _render_operations_upload():
     st.subheader("\U0001F4E4 Upload Monthly Data")
     st.write(
         "Drag & drop **any** Excel/CSV export of your driver roster and/or monthly "
@@ -2755,6 +3017,75 @@ def render_upload_tab():
 
     # Plain CSV -- always the single-table flow.
     _render_single_sheet_upload(uploaded_file, None)
+
+
+def _render_salary_upload():
+    st.subheader("\U0001F4B0 Upload Salary Data")
+    st.write(
+        "Separate from the roster/orders/validity upload -- use this for "
+        "your monthly salary workbook (Courier ID, Total payable amount, "
+        "Total Deduction, Final Salary, Pending, plus the company-level "
+        "summary sheet with Tax Amount). This fills in the Gross Salary, "
+        "Deductions, Net Salary, and Pending Salary figures shown on the "
+        "**Financial & Payroll** tab -- existing riders/months are "
+        "updated in place, so re-uploading the same file is always safe."
+    )
+    st.caption(
+        "Every sheet is inspected automatically: the per-rider sheet "
+        "(however it's named -- 'JAN SALARY', 'riderDetail', etc.) and "
+        "the one-row company summary sheet are both recognized by their "
+        "columns, not their sheet name."
+    )
+
+    salary_file = st.file_uploader(
+        "Choose the salary Excel file", type=["xlsx", "xls"], key="salary_uploader"
+    )
+    if salary_file is None:
+        return
+
+    inferred_month = _infer_month_from_filename(salary_file.name) or datetime.today().strftime("%Y-%m")
+    salary_month = st.text_input(
+        "Which month does this file cover, if a sheet doesn't already say? (YYYY-MM)",
+        value=inferred_month,
+        key="salary_month_input",
+        help="Used only as a fallback -- if a sheet has its own 'Billing Cycle' "
+             "column (e.g. 'Feb 2026'), that value wins for each row.",
+    )
+    existing_months = distinct_months()
+    if salary_month.strip() in existing_months:
+        st.info(
+            f"\u2139\uFE0F There's already payroll data on file for "
+            f"**{salary_month.strip()}**. Importing will update matching "
+            f"riders' salary figures for that month rather than duplicate them."
+        )
+
+    if st.button("\U0001F4B0 Import Salary Data", type="primary"):
+        if not salary_month.strip():
+            st.error("Please provide a fallback month (YYYY-MM).")
+        else:
+            with st.spinner("Reading and matching salary data..."):
+                result = process_salary_workbook(salary_file, salary_month.strip())
+
+            st.success(f"Updated salary figures for {result['riders_updated']} rider(s).")
+            if result["summary_written"]:
+                st.caption(
+                    f"Also recorded {result['summary_written']} company-level "
+                    f"summary row(s) (total money received, tax amount)."
+                )
+            if result["placeholders_created"]:
+                st.warning(
+                    f"\u26A0\uFE0F {result['placeholders_created']} rider(s) in this file "
+                    f"weren't found in your roster (by ID or name) -- placeholder "
+                    f"profiles were created so their salary data wasn't lost. "
+                    f"Find and fix them in **Rider Lookup** (search 'Unknown Rider')."
+                )
+
+            st.markdown("##### What each sheet was used for")
+            report_df = pd.DataFrame(
+                result["sheet_report"], columns=["Sheet", "Detected as", "Rows"]
+            )
+            st.dataframe(report_df, use_container_width=True, hide_index=True)
+            st.rerun()
 
 
 def _render_single_sheet_upload(uploaded_file, sheet_name):
