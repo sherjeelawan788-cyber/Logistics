@@ -1693,13 +1693,24 @@ def _normalize_header(h: str) -> str:
     return str(h).strip().lower().replace("_", " ")
 
 
+_GENERIC_HEADER_STOPWORDS = {"total", "amount", "sum", "value", "grand total"}
+
+
 def _guess_column(columns: list, aliases: list) -> str:
-    """Return the best-matching source column for a field, or NONE_OPTION."""
+    """Return the best-matching source column for a field, or NONE_OPTION.
+    A bare, ultra-generic header like "Total" or "Amount" is excluded from
+    the fuzzy substring fallback -- it would otherwise fuzzy-match almost
+    any alias list (a deduction sheet's "Total", a validity sheet's
+    "Total", an orders sheet's "Total" all look identical by header name
+    alone), silently misclassifying entire sheets. Exact matches are still
+    allowed even for these words."""
     normed = {c: _normalize_header(c) for c in columns}
     for col, norm in normed.items():
         if norm in aliases:
             return col
     for col, norm in normed.items():
+        if norm in _GENERIC_HEADER_STOPWORDS:
+            continue
         for alias in aliases:
             if alias in norm or norm in alias:
                 return col
@@ -2380,20 +2391,39 @@ def _classify_sheet(df: pd.DataFrame) -> str:
     if has_name and has_id and (has_vehicle_hint or has_status_hint):
         return "roster"
 
-    if _guess_column(cols, FIELD_ALIASES["total_orders"]) != NONE_OPTION:
-        return "orders"
-
+    # Day-by-day grid sheets (columns literally named '1'..'31') are
+    # classified by their CELL CONTENT, not by any header name -- this is
+    # checked before the generic total_orders header check below because a
+    # day-by-day ORDER COUNT grid often has nothing but a vague "Total"
+    # column for its header, which is deliberately excluded from fuzzy
+    # header matching (see _GENERIC_HEADER_STOPWORDS) to stop it from
+    # mis-tagging validity/deduction/other sheets as "orders". Content is
+    # the reliable signal here: mostly VALID/INVALID -> validity; mostly
+    # P/OFF/ABSENT-style attendance tokens -> attendance; mostly plain
+    # numbers (daily order counts, with some "OFF"/"NO SHIFT" text on
+    # non-working days) -> orders.
     day_cols = _day_number_columns(cols)
     if len(day_cols) >= 15:
         sample = set()
-        for c in day_cols[:6]:
-            vals = df[c].dropna().astype(str).str.strip().str.upper().unique().tolist()
-            sample.update(vals[:12])
+        numeric_hits, checked = 0, 0
+        for c in day_cols[:8]:
+            vals = df[c].dropna().astype(str).str.strip()
+            for v in vals.head(25):
+                checked += 1
+                vu = v.upper()
+                sample.add(vu)
+                if re.match(r"^-?\d+(\.\d+)?$", v):
+                    numeric_hits += 1
         if sample & VALIDITY_TOKENS:
             return "validity"
+        if numeric_hits and checked and (numeric_hits / checked) >= 0.4:
+            return "orders"
         if sample & ATTENDANCE_TOKENS:
             return "attendance"
         return "unrecognized"
+
+    if _guess_column(cols, FIELD_ALIASES["total_orders"]) != NONE_OPTION:
+        return "orders"
 
     lower_cols = [str(c).strip().lower() for c in cols]
     if any("order id" in c for c in lower_cols) and any("name" in c for c in lower_cols) and not has_id:
@@ -2458,20 +2488,25 @@ def _extract_roster(df: pd.DataFrame) -> dict:
     join_col = _guess_column(cols, FIELD_ALIASES["join_date"])
     end_col = _guess_column(cols, FIELD_ALIASES["termination_date"])
 
-    # If no column was found by HEADER NAME for vehicle type, look for one
-    # by CONTENT instead (a 'Status' or 'Plate Number' column that's
-    # actually full of 'Own Car'/'Company Car' values). If that turns out
-    # to be the very same column we picked for driver status, it isn't
-    # really a driver-status column at all -- fall status back to the
-    # termination-date default instead of feeding it vehicle-type text.
-    if veh_col == NONE_OPTION:
-        exclude = {id_col, name_col, first_col, last_col, phone_col, sup_col,
-                   sponsor_col, iqama_col, join_col, end_col}
-        content_veh_col = _find_vehicle_type_column_by_content(df, exclude)
-        if content_veh_col is not None:
+    # Content beats header name for vehicle type: even when a column was
+    # found BY HEADER NAME, also check every other column's actual values.
+    # If some other column is (almost) entirely literal 'Own Car'/'Company
+    # Car' text, that's unambiguous ground truth and wins -- a header-name
+    # guess can point at the wrong column (e.g. a generic "Type" column
+    # that isn't actually vehicle type at all), but real 'Own Car'/
+    # 'Company Car' text in a column can't lie about what it is.
+    exclude = {id_col, name_col, first_col, last_col, phone_col, sup_col,
+               sponsor_col, iqama_col, join_col, end_col}
+    content_veh_col = _find_vehicle_type_column_by_content(df, exclude)
+    if content_veh_col is not None and content_veh_col != veh_col:
+        content_ratio = _vehicle_type_content_ratio(df, content_veh_col)
+        header_ratio = _vehicle_type_content_ratio(df, veh_col) if veh_col != NONE_OPTION else 0.0
+        if content_ratio >= 0.9 and content_ratio > header_ratio:
             veh_col = content_veh_col
-            if status_col == content_veh_col:
-                status_col = NONE_OPTION
+    if veh_col != NONE_OPTION and status_col == veh_col:
+        # Whatever we ended up using for vehicle type isn't really a
+        # driver-status column -- don't feed vehicle-type text into status.
+        status_col = NONE_OPTION
     elif _column_looks_like_vehicle_type(df, status_col):
         # A dedicated vehicle-type column exists, but the "status" column
         # ALSO turned out to be vehicle-type text (not a real Active/
@@ -2525,8 +2560,13 @@ def _extract_orders(df: pd.DataFrame):
     id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
     orders_col = _guess_column(cols, FIELD_ALIASES["total_orders"])
     name_col = _guess_column(cols, FIELD_ALIASES["driver_name"])
-    if id_col == NONE_OPTION or orders_col == NONE_OPTION:
+    if id_col == NONE_OPTION:
         return {}, {}
+
+    day_cols = _day_number_columns(cols) if orders_col == NONE_OPTION else []
+    if orders_col == NONE_OPTION and not day_cols:
+        return {}, {}
+
     out = {}
     id_to_name = {}
     for _, raw in df.iterrows():
@@ -2535,7 +2575,16 @@ def _extract_orders(df: pd.DataFrame):
         driver_id = _clean_id_value(raw[id_col])
         if not driver_id:
             continue
-        out[driver_id] = out.get(driver_id, 0) + _clean_number_value(raw[orders_col], as_int=True)
+        if orders_col != NONE_OPTION:
+            row_total = _clean_number_value(raw[orders_col], as_int=True)
+        else:
+            # No single "Total Orders" column -- this is a day-by-day grid
+            # (columns named 1..31) holding a daily order count per day,
+            # with text like "OFF"/"NO SHIFT"/"ABSENT" on non-working days.
+            # Sum whichever cells are actually numbers; non-numeric cells
+            # contribute 0 rather than breaking the row.
+            row_total = sum(_clean_number_value(raw[c], as_int=True) for c in day_cols)
+        out[driver_id] = out.get(driver_id, 0) + row_total
         if name_col != NONE_OPTION and not pd.isna(raw[name_col]):
             nm = str(raw[name_col]).strip()
             if nm:
