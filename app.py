@@ -1693,7 +1693,7 @@ def _normalize_header(h: str) -> str:
     return str(h).strip().lower().replace("_", " ")
 
 
-_GENERIC_HEADER_STOPWORDS = {"total", "amount", "sum", "value", "grand total"}
+_GENERIC_HEADER_STOPWORDS = {"total", "amount", "sum", "value", "grand total", "date"}
 
 
 def _guess_column(columns: list, aliases: list) -> str:
@@ -2358,13 +2358,28 @@ def process_salary_workbook(uploaded_file, default_month: str) -> dict:
 
 
 def _day_number_columns(columns) -> list:
-    """Columns literally named '1'..'31' (as produced once the smart header
-    picks the row with day-of-month numbers) -- the day-by-day grid layout
-    used by validity/attendance report sheets."""
+    """Columns representing one calendar day each -- either literally
+    named '1'..'31' (a plain day-of-month grid), OR an actual date value
+    like '2026-05-01' or '2026-05-01 00:00:00' (common when the sheet's
+    real header row uses full dates instead of bare day numbers). Both
+    layouts are used interchangeably by validity/attendance/order-count
+    report sheets, so both must be recognized the same way."""
     out = []
     for c in columns:
         s = str(c).strip()
         if s.isdigit() and 1 <= int(s) <= 31:
+            out.append(c)
+            continue
+        date_part = s.split(" ")[0]
+        matched = False
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%m-%Y"):
+            try:
+                datetime.strptime(date_part, fmt)
+                matched = True
+                break
+            except ValueError:
+                continue
+        if matched:
             out.append(c)
     return out
 
@@ -2375,12 +2390,31 @@ def _classify_sheet(df: pd.DataFrame) -> str:
     cols = list(df.columns)
 
     has_name = _guess_column(cols, FIELD_ALIASES["driver_name"]) != NONE_OPTION
-    has_id = _guess_column(cols, FIELD_ALIASES["driver_id"]) != NONE_OPTION
-    has_vehicle_hint = (
-        _guess_column(cols, FIELD_ALIASES["vehicle_type"]) != NONE_OPTION
-        or any("plate" in str(c).lower() for c in cols)
-    )
-    has_status_hint = _guess_column(cols, FIELD_ALIASES["status"]) != NONE_OPTION
+    id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
+    has_id = id_col != NONE_OPTION
+
+    # A roster sheet is distinguished from OTHER Courier-ID+Name sheets
+    # (accident logs, equipment/petrol-card logs, order reports -- all of
+    # which legitimately carry the same ID/name columns as the roster,
+    # since they're exports from the same rider database) by genuine
+    # vehicle-assignment evidence: either a column literally headed
+    # "Vehicle Type" etc, OR -- since many real exports bury this info in
+    # a generically-named column like "Status" -- a column whose ACTUAL
+    # VALUES are overwhelmingly literal "Own Car"/"Company Car" text.
+    # A loose "any column with 'plate' in its name" or "any column named
+    # something like 'status'" check used to be enough to trigger this,
+    # but both of those show up on plenty of non-roster sheets too (an
+    # accident log's "Plate_No", an equipment log's workflow "STATUS")
+    # and were silently corrupting driver records -- most damagingly, an
+    # accident/equipment sheet's own "Date"/"Ending Date" column (about
+    # the incident or the equipment task, not the RIDER) getting read as
+    # that rider's termination date and marking active people "Terminated".
+    has_vehicle_hint = _guess_column(cols, FIELD_ALIASES["vehicle_type"]) != NONE_OPTION
+    if not has_vehicle_hint and has_name and has_id:
+        name_col = _guess_column(cols, FIELD_ALIASES["driver_name"])
+        content_col = _find_vehicle_type_column_by_content(df, {id_col, name_col})
+        if content_col is not None and _vehicle_type_content_ratio(df, content_col) >= 0.9:
+            has_vehicle_hint = True
 
     # Roster is checked FIRST, before the orders-column shortcut below. A
     # roster export that also happens to carry an orders-like column (e.g.
@@ -2388,7 +2422,7 @@ def _classify_sheet(df: pd.DataFrame) -> str:
     # dedicated orders sheet -- doing so used to add its numbers a second
     # time on top of the real orders sheet elsewhere in the same workbook,
     # which is what caused totals to come out doubled.
-    if has_name and has_id and (has_vehicle_hint or has_status_hint):
+    if has_name and has_id and has_vehicle_hint:
         return "roster"
 
     # Day-by-day grid sheets (columns literally named '1'..'31') are
@@ -2423,6 +2457,13 @@ def _classify_sheet(df: pd.DataFrame) -> str:
         return "unrecognized"
 
     if _guess_column(cols, FIELD_ALIASES["total_orders"]) != NONE_OPTION:
+        lower_cols = [str(c).strip().lower() for c in cols]
+        if any("need more" in c or "shift time" in c for c in lower_cols):
+            # A target/coaching-tracker sheet (e.g. "TARGET B RIDERS") --
+            # its ORDERS column is an interim snapshot for a subset of
+            # riders, not the authoritative monthly total. Summing it in
+            # alongside the real order report double-counts those riders.
+            return "unrecognized"
         return "orders"
 
     lower_cols = [str(c).strip().lower() for c in cols]
