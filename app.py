@@ -3449,7 +3449,7 @@ def render_month_reveal_cards(rows: pd.DataFrame, join_date: str, vehicle_type: 
     st.markdown(css + "".join(cards) + "</div>", unsafe_allow_html=True)
 
 
-def render_rider_lookup():
+def render_rider_lookup(filters: dict):
     st.subheader("\U0001F50D Rider Lookup")
     st.write("Search by name, ID, IQAMA, or phone -- matching riders update instantly below.")
 
@@ -3527,25 +3527,62 @@ def render_rider_lookup():
         st.info("No monthly logs on file for this rider yet.")
         return
 
-    st.markdown("#### Lifetime Totals")
-    stat_cards([
-        {"icon": "\U0001F4E6", "label": "Total Orders", "value": f"{int(rider_logs['total_orders'].sum()):,}",
-         "tip": "Across every month on file", "variant": "a"},
-        {"icon": "\u274C", "label": "Total Cancelled", "value": f"{int(rider_logs['cancelled_orders'].sum()):,}",
-         "tip": "Cancelled orders, all-time", "variant": "c"},
-        {"icon": "\U0001F4B5", "label": "Total Gross Earned", "value": f"Rs {rider_logs['gross_salary'].sum():,.0f}",
-         "tip": "Before deductions, all-time", "variant": "b"},
-        {"icon": "\u23F3", "label": "Total Pending", "value": f"Rs {rider_logs['pending_salary'].sum():,.0f}",
-         "tip": "Still owed to this rider", "variant": "d"},
-    ])
-    stat_cards([
-        {"icon": "\u2705", "label": "Months Valid", "value": int((rider_logs["validity_status"] == "Valid").sum()),
-         "tip": "Months marked Valid", "variant": "a"},
-        {"icon": "\u274C", "label": "Months Invalid", "value": int((rider_logs["validity_status"] == "Invalid").sum()),
-         "tip": "Months marked Invalid", "variant": "c"},
-        {"icon": "\U0001F4C5", "label": "Total Days Worked", "value": int(rider_logs["valid_days_in_month"].sum()),
-         "tip": "Summed attendance across all months", "variant": "b"},
-    ])
+    selected_month = filters.get("month")
+    st.markdown(f"#### \U0001F4C5 {month_display(selected_month)}" if selected_month else "#### This Month")
+
+    if not selected_month:
+        st.caption(
+            "No month is selected in the sidebar filter -- pick one there "
+            "to see this rider's figures for that specific month."
+        )
+    else:
+        month_row = rider_logs[rider_logs["month_year"] == selected_month]
+        if month_row.empty:
+            st.info(f"No log on file for {profile['driver_name']} in {month_display(selected_month)}.")
+        else:
+            r = month_row.iloc[0]
+            stat_cards([
+                {"icon": "\U0001F4E6", "label": "Orders", "value": f"{int(r['total_orders']):,}",
+                 "tip": "Completed orders this month", "variant": "a"},
+                {"icon": "\u274C", "label": "Cancelled", "value": f"{int(r['cancelled_orders']):,}",
+                 "tip": "Cancelled orders this month", "variant": "c"},
+                {"icon": "\U0001F4C5", "label": "Days Worked", "value": int(r["valid_days_in_month"]),
+                 "tip": "Attendance this month", "variant": "b"},
+                {"icon": "\u2705" if r["validity_status"] == "Valid" else "\u274C",
+                 "label": "Validity", "value": r["validity_status"] or "N/A",
+                 "tip": "Validity status for this month", "variant": "a" if r["validity_status"] == "Valid" else "c"},
+            ])
+            stat_cards([
+                {"icon": "\U0001F4B5", "label": "Gross Salary", "value": f"Rs {r['gross_salary']:,.0f}",
+                 "tip": "Before deductions, this month", "variant": "b"},
+                {"icon": "\u2796", "label": "Deductions", "value": f"Rs {r['total_deductions']:,.0f}",
+                 "tip": "Deducted this month", "variant": "c"},
+                {"icon": "\u2705", "label": "Net Salary", "value": f"Rs {r['net_salary']:,.0f}",
+                 "tip": "Gross minus deductions, this month", "variant": "a"},
+                {"icon": "\u23F3", "label": "Pending", "value": f"Rs {r['pending_salary']:,.0f}",
+                 "tip": "Still owed for this month", "variant": "d"},
+            ])
+
+    st.markdown("---")
+    with st.expander("\U0001F4CA Lifetime Totals (all months combined)"):
+        stat_cards([
+            {"icon": "\U0001F4E6", "label": "Total Orders", "value": f"{int(rider_logs['total_orders'].sum()):,}",
+             "tip": "Across every month on file", "variant": "a"},
+            {"icon": "\u274C", "label": "Total Cancelled", "value": f"{int(rider_logs['cancelled_orders'].sum()):,}",
+             "tip": "Cancelled orders, all-time", "variant": "c"},
+            {"icon": "\U0001F4B5", "label": "Total Gross Earned", "value": f"Rs {rider_logs['gross_salary'].sum():,.0f}",
+             "tip": "Before deductions, all-time", "variant": "b"},
+            {"icon": "\u23F3", "label": "Total Pending", "value": f"Rs {rider_logs['pending_salary'].sum():,.0f}",
+             "tip": "Still owed to this rider", "variant": "d"},
+        ])
+        stat_cards([
+            {"icon": "\u2705", "label": "Months Valid", "value": int((rider_logs["validity_status"] == "Valid").sum()),
+             "tip": "Months marked Valid", "variant": "a"},
+            {"icon": "\u274C", "label": "Months Invalid", "value": int((rider_logs["validity_status"] == "Invalid").sum()),
+             "tip": "Months marked Invalid", "variant": "c"},
+            {"icon": "\U0001F4C5", "label": "Total Days Worked", "value": int(rider_logs["valid_days_in_month"].sum()),
+             "tip": "Summed attendance across all months", "variant": "b"},
+        ])
 
     st.markdown("---")
     st.markdown("#### Month-by-Month History")
@@ -3686,7 +3723,7 @@ def main():
     with tab3:
         render_upload_tab()
     with tab4:
-        render_rider_lookup()
+        render_rider_lookup(filters)
     with tab5:
         render_supervisor_alerts()
 
