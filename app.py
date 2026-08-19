@@ -641,6 +641,11 @@ def render_header(filters: dict):
     large layered-3D animated Tamkeen mark dead center, big money/orders
     stat cards on the right. Every card pops up (lift + tooltip) on hover."""
     merged = load_merged()
+    # Placeholder drivers (created only because some report mentioned an
+    # ID/name that didn't match anyone on the actual roster) should not
+    # inflate headcount/active counts -- but their order/salary figures
+    # still belong in the money totals, so those stay unfiltered.
+    roster_only = merged[merged["is_placeholder"] == 0] if not merged.empty else merged
 
     headcount = active = 0
     orders_m = 0
@@ -652,17 +657,18 @@ def render_header(filters: dict):
             # for THIS month -- not the entire all-time roster -- so
             # switching the month filter shows that month's own numbers
             # instead of an ever-growing all-time total.
-            month_df = merged[merged["month_year"] == filters["month"]]
+            month_df = roster_only[roster_only["month_year"] == filters["month"]]
             month_df = month_df[
                 month_df["supervisor_name"].isin(filters["supervisors"])
                 & month_df["vehicle_type"].isin(filters["vehicle_types"])
             ]
             headcount = month_df["driver_id"].nunique()
             active = int(month_df[month_df["status"] == "Active"]["driver_id"].nunique())
-            orders_m = int(month_df["total_orders"].sum())
-            gross_m = float(month_df["gross_salary"].sum())
+            money_df = merged[merged["month_year"] == filters["month"]]
+            orders_m = int(money_df["total_orders"].sum())
+            gross_m = float(money_df["gross_salary"].sum())
         else:
-            roster = merged.drop_duplicates(subset="driver_id")
+            roster = roster_only.drop_duplicates(subset="driver_id")
             roster_f = roster[
                 roster["supervisor_name"].isin(filters["supervisors"])
                 & roster["vehicle_type"].isin(filters["vehicle_types"])
@@ -976,6 +982,7 @@ def init_db() -> None:
     # --- Forward migrations for fields added after the initial release ---
     _add_column_if_missing(conn, "drivers", "iqama_number TEXT")
     _add_column_if_missing(conn, "drivers", "sponsor_name TEXT")
+    _add_column_if_missing(conn, "drivers", "is_placeholder INTEGER NOT NULL DEFAULT 0")
     _add_column_if_missing(conn, "monthly_logs", "cancelled_orders INTEGER NOT NULL DEFAULT 0")
     _add_column_if_missing(conn, "monthly_logs", "pending_salary REAL NOT NULL DEFAULT 0")
 
@@ -990,18 +997,28 @@ def upsert_driver(conn: sqlite3.Connection, row: dict) -> None:
     vehicle-type column at all (e.g. an Orders, Validity, or Attendance
     report) must never silently reset an existing driver's 'Company Car'
     back to the default 'Own Car'. That silent reset on every later
-    upload is what was inflating the Own Car count."""
+    upload is what was inflating the Own Car count.
+
+    Pass is_placeholder=True only when this row exists SOLELY because some
+    OTHER report (orders/validity/salary/etc) mentioned an ID or name that
+    couldn't be matched to anyone on the actual roster -- these are kept
+    so the associated data isn't lost, but excluded from headcount/status/
+    vehicle KPI counts elsewhere so those numbers reflect the real roster.
+    A real roster row always clears this flag, even for a driver_id that
+    was previously placeholder-only."""
     existing_vehicle = conn.execute(
         "SELECT vehicle_type FROM drivers WHERE driver_id = ?", (row["driver_id"],)
     ).fetchone()
     vehicle_type = row.get("vehicle_type") or (existing_vehicle[0] if existing_vehicle else None) or "Own Car"
+    is_placeholder = 1 if row.get("is_placeholder") else 0
 
     conn.execute(
         """
         INSERT INTO drivers
             (driver_id, driver_name, phone, supervisor_name, status,
-             vehicle_type, join_date, termination_date, iqama_number, sponsor_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             vehicle_type, join_date, termination_date, iqama_number,
+             sponsor_name, is_placeholder)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(driver_id) DO UPDATE SET
             driver_name       = excluded.driver_name,
             phone             = COALESCE(NULLIF(excluded.phone, ''), drivers.phone),
@@ -1011,13 +1028,15 @@ def upsert_driver(conn: sqlite3.Connection, row: dict) -> None:
             join_date         = COALESCE(NULLIF(excluded.join_date, ''), drivers.join_date),
             termination_date  = excluded.termination_date,
             iqama_number      = COALESCE(NULLIF(excluded.iqama_number, ''), drivers.iqama_number),
-            sponsor_name      = COALESCE(NULLIF(excluded.sponsor_name, ''), drivers.sponsor_name)
+            sponsor_name      = COALESCE(NULLIF(excluded.sponsor_name, ''), drivers.sponsor_name),
+            is_placeholder    = CASE WHEN excluded.is_placeholder = 0 THEN 0 ELSE drivers.is_placeholder END
         """,
         (
             row["driver_id"], row["driver_name"], row.get("phone"),
             row.get("supervisor_name"), row.get("status", "Active"),
             vehicle_type, row.get("join_date"),
             row.get("termination_date"), row.get("iqama_number"), row.get("sponsor_name"),
+            is_placeholder,
         ),
     )
 
@@ -1255,7 +1274,7 @@ def load_merged() -> pd.DataFrame:
         """
         SELECT d.driver_id, d.driver_name, d.phone, d.supervisor_name,
                d.status, d.vehicle_type, d.join_date, d.termination_date,
-               d.iqama_number, d.sponsor_name,
+               d.iqama_number, d.sponsor_name, d.is_placeholder,
                m.log_id, m.month_year, m.total_orders, m.gross_salary,
                m.total_deductions, m.net_salary, m.validity_status,
                m.valid_days_in_month, m.cancelled_orders, m.pending_salary
@@ -1397,6 +1416,14 @@ def render_dashboard(filters: dict):
         st.info("No data available yet. Use **Seed Sample Data** in the sidebar or upload a file.")
         return
 
+    # Placeholder drivers (created only because some report -- orders,
+    # validity, salary, etc -- mentioned an ID/name that didn't match
+    # anyone on the actual roster) must not inflate headcount/active/
+    # vehicle-type counts. Their order/salary data is still usable
+    # elsewhere (Rider Lookup, Financial totals); this only affects "how
+    # many riders are there" style KPI cards.
+    roster_source = merged[merged["is_placeholder"] == 0]
+
     all_months = distinct_months()
     if all_months:
         oldest, newest = min(all_months), max(all_months)
@@ -1409,16 +1436,21 @@ def render_dashboard(filters: dict):
             f"~{span_years:.1f} year(s) of data on file)."
         )
 
-    roster = merged.drop_duplicates(subset="driver_id")
+    roster = roster_source.drop_duplicates(subset="driver_id")
     roster_filtered = roster[
         roster["supervisor_name"].isin(filters["supervisors"])
         & roster["vehicle_type"].isin(filters["vehicle_types"])
     ]
 
-    month_df = merged[merged["month_year"] == filters["month"]] if filters["month"] else merged.iloc[0:0]
+    month_df = roster_source[roster_source["month_year"] == filters["month"]] if filters["month"] else roster_source.iloc[0:0]
     month_df = month_df[
         month_df["supervisor_name"].isin(filters["supervisors"])
         & month_df["vehicle_type"].isin(filters["vehicle_types"])
+    ]
+    money_df = merged[merged["month_year"] == filters["month"]] if filters["month"] else merged.iloc[0:0]
+    money_df = money_df[
+        money_df["supervisor_name"].isin(filters["supervisors"])
+        & money_df["vehicle_type"].isin(filters["vehicle_types"])
     ]
 
     if filters["month"]:
@@ -1472,13 +1504,13 @@ def render_dashboard(filters: dict):
     ])
 
     stat_cards([
-        {"icon": "\U0001F4E6", "label": "Total Orders (month)", "value": f"{int(month_df['total_orders'].sum()):,}",
+        {"icon": "\U0001F4E6", "label": "Total Orders (month)", "value": f"{int(money_df['total_orders'].sum()):,}",
          "tip": "Sum of all completed orders this month", "variant": "a"},
-        {"icon": "\u274C", "label": "Cancelled Orders (month)", "value": f"{int(month_df['cancelled_orders'].sum()):,}",
+        {"icon": "\u274C", "label": "Cancelled Orders (month)", "value": f"{int(money_df['cancelled_orders'].sum()):,}",
          "tip": "Orders cancelled across the whole team", "variant": "c"},
-        {"icon": "\U0001F4B5", "label": "Gross Salary (month)", "value": f"Rs {month_df['gross_salary'].sum():,.0f}",
+        {"icon": "\U0001F4B5", "label": "Gross Salary (month)", "value": f"Rs {money_df['gross_salary'].sum():,.0f}",
          "tip": "Total pay before deductions", "variant": "b"},
-        {"icon": "\u23F3", "label": "Pending Salary (month)", "value": f"Rs {month_df['pending_salary'].sum():,.0f}",
+        {"icon": "\u23F3", "label": "Pending Salary (month)", "value": f"Rs {money_df['pending_salary'].sum():,.0f}",
          "tip": "Amount still owed, not yet paid out", "variant": "d"},
     ])
 
@@ -2314,6 +2346,7 @@ def process_salary_workbook(uploaded_file, default_month: str) -> dict:
                         "driver_id": driver_id,
                         "driver_name": name or f"Unknown Rider ({driver_id})",
                         "status": "Active",
+                        "is_placeholder": True,
                     },
                 )
                 known_driver_ids.add(driver_id)
@@ -2512,7 +2545,34 @@ def _find_vehicle_type_column_by_content(df: pd.DataFrame, exclude_cols: set):
     return best_col if best_ratio >= 0.5 else None
 
 
-def _extract_roster(df: pd.DataFrame) -> dict:
+_SECTION_STATUS_KEYWORDS = [
+    (["terminat"], "Terminated"),
+    (["vacation", "vocation", "on leave", "leave"], "Suspended"),
+    (["suspend"], "Suspended"),
+    (["active rider", "back to active", "reactivat"], "Active"),
+]
+
+
+def _section_status_label(raw_row):
+    """Real-world roster sheets sometimes pack THREE lists into one sheet:
+    the active roster, then a 'TERMINATE FOR THIS MONTH' label followed by
+    terminated riders, then an 'ON VOCATION' label followed by suspended
+    riders -- with no per-row status column at all, just these section
+    headers. A section-header row has exactly ONE filled cell in the
+    entire row (a label, not driver data); a real driver row always has
+    several (at minimum an ID and a name). Returns the status that should
+    apply to rows AFTER this one, or None if this isn't a section header."""
+    texts = [str(v).strip() for v in raw_row if not (isinstance(v, float) and pd.isna(v)) and str(v).strip()]
+    if len(texts) != 1:
+        return None
+    label = texts[0].lower()
+    for keywords, status in _SECTION_STATUS_KEYWORDS:
+        if any(k in label for k in keywords):
+            return status
+    return None
+
+
+def _extract_roster(df: pd.DataFrame, default_month: str = None) -> dict:
     """driver_id -> roster fields dict, plus a name->id lookup for later
     name-based matching (used by the cancellation sheet, which has no ID)."""
     cols = list(df.columns)
@@ -2555,7 +2615,12 @@ def _extract_roster(df: pd.DataFrame) -> dict:
         status_col = NONE_OPTION
 
     records = {}
+    section_status = "Active"
     for _, raw in df.iterrows():
+        detected_section = _section_status_label(raw)
+        if detected_section is not None:
+            section_status = detected_section
+            continue  # this row is a label ("TERMINATE FOR THIS MONTH"), not a rider
         if _row_is_summary(raw):
             continue
         if name_col != NONE_OPTION:
@@ -2575,7 +2640,18 @@ def _extract_roster(df: pd.DataFrame) -> dict:
 
         termination_date = _clean_date_value(raw[end_col]) if end_col != NONE_OPTION else None
         status_val = str(raw[status_col]).strip() if status_col != NONE_OPTION and not pd.isna(raw[status_col]) else ""
-        status = status_val if status_val in DRIVER_STATUSES else ("Terminated" if termination_date else "Active")
+        if section_status != "Active":
+            # A section header ("TERMINATE FOR THIS MONTH", "ON VOCATION")
+            # is an explicit, deliberate signal from whoever built the
+            # sheet -- it overrides the column-based guess below. If the
+            # sheet didn't also give an explicit date, anchor it to the
+            # month being imported so "Terminated (this month)" on the
+            # dashboard (which keys off termination_date) still counts it.
+            status = section_status
+            if not termination_date and default_month:
+                termination_date = f"{default_month}-01"
+        else:
+            status = status_val if status_val in DRIVER_STATUSES else ("Terminated" if termination_date else "Active")
 
         records[driver_id] = {
             "driver_id": driver_id,
@@ -2827,7 +2903,7 @@ def process_workbook_all_sheets(uploaded_file, month_year: str):
         sheet_report.append((sheet_name, kind, len(df)))
 
         if kind == "roster":
-            roster_records.update(_extract_roster(df))
+            roster_records.update(_extract_roster(df, month_year))
         elif kind == "orders":
             orders_dict, names = _extract_orders(df)
             orders_sheets.append((sheet_name, orders_dict))
@@ -2921,6 +2997,7 @@ def process_workbook_all_sheets(uploaded_file, month_year: str):
                 "driver_id": driver_id,
                 "driver_name": f"Unknown Rider ({driver_id})",
                 "status": "Active",
+                "is_placeholder": True,
             },
         )
         placeholders_created += 1
