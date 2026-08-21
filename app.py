@@ -148,6 +148,21 @@ def inject_custom_css():
             gap: 16px;
             margin: 10px 0 18px 0;
           }
+          /* Plain vertical stack, always full column width -- used for
+             the header's 2-card stacks so they don't inherit stat-grid's
+             auto-fit track sizing (which can leave odd empty space when
+             a Streamlit column is narrower than the grid expects). */
+          .stat-col {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+          }
+          .stat-col .stat-card2 {
+            width: 100%;
+            max-width: 260px;
+            margin: 0 auto;
+            box-sizing: border-box;
+          }
           .stat-card2 {
             position: relative;
             border-radius: 16px;
@@ -157,6 +172,7 @@ def inject_custom_css():
             animation: fadeInUp 0.5s ease both;
             transition: transform 0.22s cubic-bezier(.2,.8,.3,1.3), box-shadow 0.22s ease;
             cursor: default;
+            text-align: center;
           }
           .stat-card2.v-a { background: linear-gradient(135deg, rgba(34,197,94,0.15), rgba(59,130,246,0.08)); }
           .stat-card2.v-b { background: linear-gradient(135deg, rgba(168,85,247,0.15), rgba(59,130,246,0.08)); }
@@ -171,8 +187,9 @@ def inject_custom_css():
           .stat-label2 {
             font-size: 11.5px; letter-spacing: 1.1px; text-transform: uppercase;
             opacity: 0.64; margin-top: 7px; font-weight: 700;
+            color: var(--text-color);
           }
-          .stat-value2 { font-size: 25px; font-weight: 900; margin-top: 3px; }
+          .stat-value2 { font-size: 25px; font-weight: 900; margin-top: 3px; color: var(--text-color); }
           .stat-tip {
             position: absolute; left: 50%; bottom: calc(100% + 10px);
             transform: translate(-50%, 6px);
@@ -201,6 +218,28 @@ def stat_cards(cards: list) -> None:
     every dict may include: icon, label, value, tip (tooltip text), variant
     ('a'/'b'/'c'/'d' for different accent colors)."""
     html = ['<div class="stat-grid">']
+    for c in cards:
+        variant = c.get("variant", "a")
+        tip_html = f'<div class="stat-tip">{c["tip"]}</div>' if c.get("tip") else ""
+        html.append(
+            f'<div class="stat-card2 v-{variant}">'
+            f'<div class="stat-icon2">{c.get("icon", "")}</div>'
+            f'<div class="stat-label2">{c["label"]}</div>'
+            f'<div class="stat-value2">{c["value"]}</div>'
+            f"{tip_html}"
+            f"</div>"
+        )
+    html.append("</div>")
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
+def stat_cards_column(cards: list) -> None:
+    """Same visual style as stat_cards(), but a plain vertical stack that
+    always fills 100% of its container width -- used inside a narrow
+    Streamlit column (the header's left/right stat pairs), where
+    stat_cards()'s auto-fit grid can size its track oddly and leave an
+    ugly gap instead of stretching to the column's actual width."""
+    html = ['<div class="stat-col">']
     for c in cards:
         variant = c.get("variant", "a")
         tip_html = f'<div class="stat-tip">{c["tip"]}</div>' if c.get("tip") else ""
@@ -639,59 +678,38 @@ def render_header(filters: dict):
             f"</g>"
         )
 
+    # The 4 headline numbers use the SAME stat_cards() widget as the rest
+    # of the dashboard (rendered via st.markdown, in the same document as
+    # Streamlit) -- so their text color inherits var(--text-color) and
+    # switches with the theme automatically and reliably, the same way
+    # every other card in the app already does. Only the animated 3D logo
+    # (pure graphics, no readability concerns) stays in its own iframe
+    # below, since that's what the scroll-tilt effect needs.
+    col_left, col_mid, col_right = st.columns([1, 1.3, 1], vertical_alignment="center", gap="small")
+    with col_left:
+        stat_cards_column([
+            {"icon": "\U0001F465", "label": "Headcount", "value": headcount,
+             "tip": "Total drivers matching your current filters", "variant": "a"},
+            {"icon": "\U0001F7E2", "label": "Active Drivers", "value": active,
+             "tip": "Currently active, not terminated or suspended", "variant": "a"},
+        ])
+    with col_right:
+        stat_cards_column([
+            {"icon": "\U0001F4E6", "label": "Orders (month)", "value": f"{orders_m:,}",
+             "tip": "Total orders logged for the selected month", "variant": "b"},
+            {"icon": "\U0001F4B0", "label": "Gross (month)", "value": f"SAR {gross_m:,.0f}",
+             "tip": "Total gross salary across all riders this month", "variant": "b"},
+        ])
+
     html = """
     <style>
       .header-row {
         display: flex;
         align-items: center;
         justify-content: center;
-        gap: 30px;
-        flex-wrap: wrap;
         padding: 8px 0 4px 0;
         font-family: Arial, Helvetica, sans-serif;
       }
-      .stat-stack { display: flex; flex-direction: column; gap: 14px; }
-      .stat-card {
-        position: relative;
-        min-width: 210px;
-        text-align: center;
-        padding: 18px 26px;
-        border-radius: 16px;
-        border: 1px solid rgba(120,120,120,0.18);
-        box-shadow: 0 6px 18px rgba(0,0,0,0.12);
-        animation: statPop 0.5s ease both;
-        transition: transform 0.22s cubic-bezier(.2,.8,.3,1.3), box-shadow 0.22s ease;
-      }
-      .stat-card:hover {
-        transform: translateY(-8px) scale(1.05);
-        box-shadow: 0 18px 34px rgba(0,0,0,0.28);
-        z-index: 6;
-      }
-      .stat-card.v-a { background: linear-gradient(135deg, rgba(34,197,94,0.18), rgba(59,130,246,0.10)); }
-      .stat-card.v-b { background: linear-gradient(135deg, rgba(168,85,247,0.18), rgba(59,130,246,0.10)); }
-      .stat-card.v-c { background: linear-gradient(135deg, rgba(239,68,68,0.16), rgba(249,115,22,0.10)); }
-      .stat-card.v-d { background: linear-gradient(135deg, rgba(250,204,21,0.18), rgba(34,197,94,0.10)); }
-      .stat-card .label {
-        font-size: 13px; letter-spacing: 1.4px; text-transform: uppercase;
-        opacity: 0.64; font-weight: 700;
-      }
-      .stat-card .value { font-size: 32px; font-weight: 900; margin-top: 4px; }
-      .stat-card .htip {
-        position: absolute; left: 50%; bottom: calc(100% + 10px); transform: translate(-50%, 6px);
-        background: #111018; color: #f3f1ff; padding: 8px 13px; border-radius: 9px; font-size: 11.5px;
-        white-space: nowrap; opacity: 0; pointer-events: none; box-shadow: 0 12px 24px rgba(0,0,0,0.4);
-        transition: opacity 0.18s ease, transform 0.18s ease;
-      }
-      .stat-card .htip::after {
-        content: ""; position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
-        border: 6px solid transparent; border-top-color: #111018;
-      }
-      .stat-card:hover .htip { opacity: 1; transform: translate(-50%, 0); }
-      @keyframes statPop {
-        from { opacity: 0; transform: translateY(10px) scale(0.96); }
-        to   { opacity: 1; transform: translateY(0) scale(1); }
-      }
-
       .logo-stage { perspective: 1800px; }
       .logo-outer {
         position: relative;
@@ -765,19 +783,6 @@ def render_header(filters: dict):
     </style>
 
     <div class="header-row">
-      <div class="stat-stack">
-        <div class="stat-card v-a">
-          <div class="label">Headcount</div>
-          <div class="value">__HEADCOUNT__</div>
-          <div class="htip">Total drivers matching your current filters</div>
-        </div>
-        <div class="stat-card v-b">
-          <div class="label">Active Drivers</div>
-          <div class="value">__ACTIVE__</div>
-          <div class="htip">Currently active, not terminated or suspended</div>
-        </div>
-      </div>
-
       <div class="logo-stage">
         <div class="logo-outer" id="logoOuter">
           <div class="logo-ring r1"></div>
@@ -805,19 +810,6 @@ def render_header(filters: dict):
             <path d="M62 25 L195 25 L195 62 L110 62 L152 98 L110 98 Z" fill="none" stroke="rgba(255,255,255,0.35)" stroke-width="1.5"/>
           </svg>
           <div class="logo-word">TAMKEEN</div>
-        </div>
-      </div>
-
-      <div class="stat-stack">
-        <div class="stat-card v-c">
-          <div class="label">Orders (month)</div>
-          <div class="value">__ORDERS__</div>
-          <div class="htip">Total orders logged for the selected month</div>
-        </div>
-        <div class="stat-card v-d">
-          <div class="label">Gross (month)</div>
-          <div class="value">__GROSS__</div>
-          <div class="htip">Total gross salary across all riders this month</div>
         </div>
       </div>
     </div>
@@ -848,14 +840,9 @@ def render_header(filters: dict):
       })();
     </script>
     """
-    html = (
-        html.replace("__EXTRUSION_LAYERS__", extrusion_layers)
-        .replace("__HEADCOUNT__", str(headcount))
-        .replace("__ACTIVE__", str(active))
-        .replace("__ORDERS__", f"{orders_m:,}")
-        .replace("__GROSS__", f"SAR {gross_m:,.0f}")
-    )
-    components.html(html, height=320)
+    html = html.replace("__EXTRUSION_LAYERS__", extrusion_layers)
+    with col_mid:
+        components.html(html, height=320)
 
 
 # ==============================================================================
@@ -3296,8 +3283,8 @@ def render_month_reveal_cards(rows: pd.DataFrame, join_date: str, vehicle_type: 
         from { opacity: 0; transform: translateY(16px) scale(0.97); }
         to   { opacity: 1; transform: translateY(0) scale(1); }
       }
-      .reveal-month { font-weight: 800; font-size: 15px; margin-bottom: 6px; }
-      .reveal-row { display: flex; justify-content: space-between; font-size: 13px; padding: 2px 0; }
+      .reveal-month { font-weight: 800; font-size: 15px; margin-bottom: 6px; color: var(--text-color); }
+      .reveal-row { display: flex; justify-content: space-between; font-size: 13px; padding: 2px 0; color: var(--text-color); }
       .reveal-row span { opacity: 0.7; }
       .reveal-badge {
         display: inline-block; margin-top: 8px; padding: 2px 10px;
@@ -3384,7 +3371,8 @@ def render_rider_lookup(filters: dict):
         f"""
         <div style="border-radius:16px; padding:16px 20px; margin-bottom:10px;
                     background:linear-gradient(135deg, rgba(34,197,94,0.10), rgba(168,85,247,0.08));
-                    border:1px solid rgba(120,120,120,0.18); animation: cardReveal 0.5s ease both;">
+                    border:1px solid rgba(120,120,120,0.18); animation: cardReveal 0.5s ease both;
+                    color: var(--text-color);">
           <div style="font-size:20px; font-weight:800;">{profile['driver_name']}</div>
           <div style="opacity:0.75; font-size:13px; margin-top:4px;">
             {profile['status']} &nbsp;|&nbsp; {profile['vehicle_type']} &nbsp;|&nbsp;
