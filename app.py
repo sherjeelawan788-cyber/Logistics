@@ -657,23 +657,25 @@ def render_header(filters: dict):
         text-align: center;
         padding: 18px 26px;
         border-radius: 16px;
-        background: linear-gradient(135deg, rgba(22,40,32,0.94), rgba(16,20,32,0.94));
-        border: 1px solid rgba(255,255,255,0.14);
-        box-shadow: 0 6px 18px rgba(0,0,0,0.30);
+        border: 1px solid rgba(120,120,120,0.18);
+        box-shadow: 0 6px 18px rgba(0,0,0,0.12);
         animation: statPop 0.5s ease both;
         transition: transform 0.22s cubic-bezier(.2,.8,.3,1.3), box-shadow 0.22s ease;
       }
       .stat-card:hover {
         transform: translateY(-8px) scale(1.05);
-        box-shadow: 0 18px 34px rgba(0,0,0,0.45);
+        box-shadow: 0 18px 34px rgba(0,0,0,0.28);
         z-index: 6;
       }
-      .stat-card.right { background: linear-gradient(135deg, rgba(36,24,44,0.94), rgba(16,20,32,0.94)); }
+      .stat-card.v-a { background: linear-gradient(135deg, rgba(34,197,94,0.18), rgba(59,130,246,0.10)); }
+      .stat-card.v-b { background: linear-gradient(135deg, rgba(168,85,247,0.18), rgba(59,130,246,0.10)); }
+      .stat-card.v-c { background: linear-gradient(135deg, rgba(239,68,68,0.16), rgba(249,115,22,0.10)); }
+      .stat-card.v-d { background: linear-gradient(135deg, rgba(250,204,21,0.18), rgba(34,197,94,0.10)); }
       .stat-card .label {
         font-size: 13px; letter-spacing: 1.4px; text-transform: uppercase;
-        color: rgba(255,255,255,0.62); font-weight: 700;
+        opacity: 0.64; font-weight: 700;
       }
-      .stat-card .value { font-size: 32px; font-weight: 900; margin-top: 4px; color: #ffffff; }
+      .stat-card .value { font-size: 32px; font-weight: 900; margin-top: 4px; }
       .stat-card .htip {
         position: absolute; left: 50%; bottom: calc(100% + 10px); transform: translate(-50%, 6px);
         background: #111018; color: #f3f1ff; padding: 8px 13px; border-radius: 9px; font-size: 11.5px;
@@ -764,12 +766,12 @@ def render_header(filters: dict):
 
     <div class="header-row">
       <div class="stat-stack">
-        <div class="stat-card">
+        <div class="stat-card v-a">
           <div class="label">Headcount</div>
           <div class="value">__HEADCOUNT__</div>
           <div class="htip">Total drivers matching your current filters</div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card v-b">
           <div class="label">Active Drivers</div>
           <div class="value">__ACTIVE__</div>
           <div class="htip">Currently active, not terminated or suspended</div>
@@ -807,12 +809,12 @@ def render_header(filters: dict):
       </div>
 
       <div class="stat-stack">
-        <div class="stat-card right">
+        <div class="stat-card v-c">
           <div class="label">Orders (month)</div>
           <div class="value">__ORDERS__</div>
           <div class="htip">Total orders logged for the selected month</div>
         </div>
-        <div class="stat-card right">
+        <div class="stat-card v-d">
           <div class="label">Gross (month)</div>
           <div class="value">__GROSS__</div>
           <div class="htip">Total gross salary across all riders this month</div>
