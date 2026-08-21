@@ -217,36 +217,8 @@ def stat_cards(cards: list) -> None:
 
 
 # ==============================================================================
-# ANIMATED 3D BRAND LOGO (Tamkeen)
-# ==============================================================================
-# Drawn entirely as inline SVG + CSS (no embedded image file) so the whole
-# app stays a small, easy-to-copy single .py file. A layered "3D extrusion"
-# (several offset, darkened copies of the same shapes stacked behind the
-# crisp full-color mark) is what actually reads as solid depth, combined
-# with a bounded tilt oscillation -- a full 360-degree spin makes a flat
-# SVG look like a broken sliver at 90/270 degrees, so we avoid that.
-
-
-# ==============================================================================
 # HQ ACCESS CONTROL  -- one Admin (you, email+password) + tracked Viewers
 # ==============================================================================
-# The first person to open the app sets up the one Admin account (email +
-# password). That password is never stored in plain text -- only a salted
-# hash, saved to a local file (hq_owner.json) next to the database.
-#
-# Everyone else who opens the app is asked for just a NAME and EMAIL (no
-# password) to "Continue as Viewer" -- this is what lets you see exactly
-# who has looked at the dashboard: every viewer who has ever identified
-# themselves is logged with first-seen/last-seen times and whether they
-# currently look "online" (active in the last few minutes). You can
-# revoke ("Remove") any viewer's access at any time from the sidebar --
-# a removed person is blocked from continuing as a viewer again until you
-# restore them.
-#
-# HONESTY NOTE (also shown in the app): a name/email here is
-# self-reported, not verified -- anyone could type someone else's name.
-# This is lightweight tracking for a trusted team, not strong identity
-# verification or enterprise-grade security.
 
 
 def _hash_password(password: str, salt: str) -> str:
@@ -305,9 +277,6 @@ def _ensure_viewer_table(conn) -> None:
         )
         """
     )
-    # Migrate an older version of this table that only had a boolean
-    # "blocked" column -- anyone already granted access under the old
-    # auto-approve system counts as already 'approved', not 'pending'.
     cols = [r[1] for r in conn.execute("PRAGMA table_info(viewer_log)").fetchall()]
     if "blocked" in cols and "status" not in cols:
         conn.execute("ALTER TABLE viewer_log ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
@@ -317,8 +286,6 @@ def _ensure_viewer_table(conn) -> None:
 
 
 def _get_viewer_status(email: str):
-    """Returns 'pending' / 'approved' / 'revoked', or None if this email
-    has never requested access before."""
     conn = get_connection()
     _ensure_viewer_table(conn)
     row = conn.execute("SELECT status FROM viewer_log WHERE email = ?", (email.strip().lower(),)).fetchone()
@@ -327,10 +294,6 @@ def _get_viewer_status(email: str):
 
 
 def _record_viewer_request(email: str, name: str) -> bool:
-    """Log a viewer's access request (or a returning approved viewer's
-    visit). Returns True if this is a BRAND NEW request (so the caller
-    knows whether to email the Admin) -- a returning viewer's status is
-    left untouched, only their name/last_seen/visits are refreshed."""
     conn = get_connection()
     _ensure_viewer_table(conn)
     email = email.strip().lower()
@@ -354,8 +317,6 @@ def _record_viewer_request(email: str, name: str) -> bool:
 
 
 def _touch_viewer_visit(email: str, name: str) -> None:
-    """Refresh last_seen/visits for an ALREADY-approved viewer, without
-    touching their status."""
     conn = get_connection()
     _ensure_viewer_table(conn)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -376,12 +337,6 @@ def _set_viewer_status(email: str, status: str) -> None:
 
 
 def _send_access_request_email(viewer_name: str, viewer_email: str) -> bool:
-    """Emails the HQ Admin when someone new requests access. Reads Gmail
-    sender credentials from Streamlit secrets ([email] address /
-    app_password) -- if those aren't configured, this silently does
-    nothing (the request still shows up in-app either way, so nothing is
-    lost, just no email alert). Returns True only if the email was
-    actually sent."""
     try:
         email_cfg = st.secrets.get("email", {})
         sender = email_cfg.get("address")
@@ -410,9 +365,6 @@ def _send_access_request_email(viewer_name: str, viewer_email: str) -> bool:
 
 
 def render_auth_gate() -> bool:
-    """Shows first-run Admin setup (once), then a sign-in / continue-as-
-    viewer screen on every subsequent run until someone picks one. Returns
-    True once it's OK to show the actual dashboard."""
     if "auth_role" not in st.session_state:
         st.session_state.auth_role = None
         st.session_state.auth_email = None
@@ -439,7 +391,6 @@ def render_auth_gate() -> bool:
             if st.button("\U0001F504 Check again"):
                 st.rerun()
             return False
-        # status is "revoked", or the record vanished somehow
         st.session_state.auth_role = None
         st.error("Your access to this dashboard has been removed by the HQ Admin.")
         return False
@@ -534,8 +485,6 @@ def render_auth_gate() -> bool:
 
 
 def render_hq_banner():
-    """HQ branding + the signed-in person's email, right-aligned at the
-    top of the dashboard (not centered)."""
     config = _load_owner_config()
     owner_email = config["email"] if config else ""
     role = st.session_state.get("auth_role")
@@ -561,10 +510,6 @@ def render_hq_banner():
 
 
 def render_hq_access_panel():
-    """Admin-only sidebar panel: pending access requests needing a
-    decision, then everyone already approved (with online status and a
-    Remove button), then anyone previously revoked (with a Restore
-    button)."""
     conn = get_connection()
     _ensure_viewer_table(conn)
     df = pd.read_sql_query(
@@ -635,17 +580,21 @@ def render_hq_access_panel():
                 st.markdown("---")
 
 
+def _active_mask(df: pd.DataFrame) -> pd.Series:
+    """A rider counts as 'Active' for a month when their employment
+    status isn't Terminated/Suspended AND they show real activity that
+    month -- days worked (from the validity/attendance sheets) or
+    completed orders. A roster's own status field is often unreliable on
+    its own (many months' files never mark anyone anything but Active
+    unless they also have a note elsewhere), so activity is what tells
+    apart someone genuinely working from someone just still listed."""
+    worked = (df["valid_days_in_month"].fillna(0) > 0) | (df["total_orders"].fillna(0) > 0)
+    not_terminated = ~df["status"].isin(["Terminated", "Suspended"])
+    return not_terminated & worked
+
+
 def render_header(filters: dict):
-    """One unified header, built as a single HTML component so everything
-    lines up in a real single row: big roster stat cards on the left, a
-    large layered-3D animated Tamkeen mark dead center, big money/orders
-    stat cards on the right. Every card pops up (lift + tooltip) on hover."""
     merged = load_merged()
-    # Placeholder drivers (created only because some report mentioned an
-    # ID/name that didn't match anyone on the actual roster) should not
-    # inflate headcount/active counts -- but their order/salary figures
-    # still belong in the money totals, so those stay unfiltered.
-    roster_only = merged[merged["is_placeholder"] == 0] if not merged.empty else merged
 
     headcount = active = 0
     orders_m = 0
@@ -653,22 +602,23 @@ def render_header(filters: dict):
 
     if not merged.empty:
         if filters["month"]:
-            # Scope headcount/active to drivers who actually have a record
-            # for THIS month -- not the entire all-time roster -- so
-            # switching the month filter shows that month's own numbers
-            # instead of an ever-growing all-time total.
-            month_df = roster_only[roster_only["month_year"] == filters["month"]]
+            month_df = merged[merged["month_year"] == filters["month"]]
             month_df = month_df[
                 month_df["supervisor_name"].isin(filters["supervisors"])
                 & month_df["vehicle_type"].isin(filters["vehicle_types"])
             ]
-            headcount = month_df["driver_id"].nunique()
-            active = int(month_df[month_df["status"] == "Active"]["driver_id"].nunique())
-            money_df = merged[merged["month_year"] == filters["month"]]
-            orders_m = int(money_df["total_orders"].sum())
-            gross_m = float(money_df["gross_salary"].sum())
+            # Headcount is scoped to riders actually listed on THIS
+            # month's roster/active-rider sheet -- not every driver_id
+            # that happens to have a log row this month (an orders or
+            # validity sheet can reference IDs the roster snapshot never
+            # had, and those shouldn't inflate headcount).
+            roster_month_df = month_df[month_df["in_roster"] == 1]
+            headcount = roster_month_df["driver_id"].nunique()
+            active = int(roster_month_df[_active_mask(roster_month_df)]["driver_id"].nunique())
+            orders_m = int(month_df["total_orders"].sum())
+            gross_m = float(month_df["gross_salary"].sum())
         else:
-            roster = roster_only.drop_duplicates(subset="driver_id")
+            roster = merged.drop_duplicates(subset="driver_id")
             roster_f = roster[
                 roster["supervisor_name"].isin(filters["supervisors"])
                 & roster["vehicle_type"].isin(filters["vehicle_types"])
@@ -676,14 +626,10 @@ def render_header(filters: dict):
             headcount = len(roster_f)
             active = int((roster_f["status"] == "Active").sum())
 
-    # Build the layered "3D extrusion" for the logo mark: the same three
-    # shapes drawn 7 times with a growing offset and darkening shade,
-    # like a stack of cards, then the crisp full-color shapes on top.
-    # This is what actually reads as "solid 3D", independent of rotation.
     extrusion_layers = ""
     layer_count = 7
     for i in range(layer_count, 0, -1):
-        shade = 10 + i * 4  # darker for deeper (further-back) layers
+        shade = 10 + i * 4
         extrusion_layers += (
             f'<g transform="translate({i * 2.6},{i * 3.2})" fill="rgb({shade},{shade},{shade})">'
             f'<path d="M25 25 L120 25 L120 62 L68 62 L68 98 L25 98 Z"/>'
@@ -711,20 +657,23 @@ def render_header(filters: dict):
         text-align: center;
         padding: 18px 26px;
         border-radius: 16px;
-        background: linear-gradient(135deg, rgba(34,197,94,0.12), rgba(59,130,246,0.09));
-        border: 1px solid rgba(120,120,120,0.20);
-        box-shadow: 0 6px 18px rgba(0,0,0,0.10);
+        background: linear-gradient(135deg, rgba(22,40,32,0.94), rgba(16,20,32,0.94));
+        border: 1px solid rgba(255,255,255,0.14);
+        box-shadow: 0 6px 18px rgba(0,0,0,0.30);
         animation: statPop 0.5s ease both;
         transition: transform 0.22s cubic-bezier(.2,.8,.3,1.3), box-shadow 0.22s ease;
       }
       .stat-card:hover {
         transform: translateY(-8px) scale(1.05);
-        box-shadow: 0 18px 34px rgba(0,0,0,0.24);
+        box-shadow: 0 18px 34px rgba(0,0,0,0.45);
         z-index: 6;
       }
-      .stat-card.right { background: linear-gradient(135deg, rgba(168,85,247,0.12), rgba(59,130,246,0.09)); }
-      .stat-card .label { font-size: 13px; letter-spacing: 1.4px; text-transform: uppercase; opacity: 0.62; font-weight: 600; }
-      .stat-card .value { font-size: 32px; font-weight: 900; margin-top: 4px; }
+      .stat-card.right { background: linear-gradient(135deg, rgba(36,24,44,0.94), rgba(16,20,32,0.94)); }
+      .stat-card .label {
+        font-size: 13px; letter-spacing: 1.4px; text-transform: uppercase;
+        color: rgba(255,255,255,0.62); font-weight: 700;
+      }
+      .stat-card .value { font-size: 32px; font-weight: 900; margin-top: 4px; color: #ffffff; }
       .stat-card .htip {
         position: absolute; left: 50%; bottom: calc(100% + 10px); transform: translate(-50%, 6px);
         background: #111018; color: #f3f1ff; padding: 8px 13px; border-radius: 9px; font-size: 11.5px;
@@ -902,7 +851,7 @@ def render_header(filters: dict):
         .replace("__HEADCOUNT__", str(headcount))
         .replace("__ACTIVE__", str(active))
         .replace("__ORDERS__", f"{orders_m:,}")
-        .replace("__GROSS__", f"Rs {gross_m:,.0f}")
+        .replace("__GROSS__", f"SAR {gross_m:,.0f}")
     )
     components.html(html, height=320)
 
@@ -913,15 +862,12 @@ def render_header(filters: dict):
 
 
 def get_connection() -> sqlite3.Connection:
-    """Open a fresh SQLite connection with foreign keys enabled."""
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column_def: str) -> None:
-    """Auto-upgrade older database files: adds a column to an existing table
-    if it is not already there. Safe to call every launch."""
     col_name = column_def.split()[0]
     existing = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
     if col_name not in existing:
@@ -929,8 +875,6 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column_def: str
 
 
 def init_db() -> None:
-    """Create tables on first launch if they do not already exist, and
-    migrate older database files forward with any newly-added columns."""
     conn = get_connection()
     cur = conn.cursor()
 
@@ -979,12 +923,11 @@ def init_db() -> None:
         """
     )
 
-    # --- Forward migrations for fields added after the initial release ---
     _add_column_if_missing(conn, "drivers", "iqama_number TEXT")
     _add_column_if_missing(conn, "drivers", "sponsor_name TEXT")
-    _add_column_if_missing(conn, "drivers", "is_placeholder INTEGER NOT NULL DEFAULT 0")
     _add_column_if_missing(conn, "monthly_logs", "cancelled_orders INTEGER NOT NULL DEFAULT 0")
     _add_column_if_missing(conn, "monthly_logs", "pending_salary REAL NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "monthly_logs", "in_roster INTEGER NOT NULL DEFAULT 0")
 
     conn.commit()
     conn.close()
@@ -993,32 +936,18 @@ def init_db() -> None:
 def upsert_driver(conn: sqlite3.Connection, row: dict) -> None:
     """Insert a driver, or update it in place if the driver_id already
     exists. Vehicle type is only overwritten when THIS row actually
-    carries a real value for it -- a report sheet that has no
-    vehicle-type column at all (e.g. an Orders, Validity, or Attendance
-    report) must never silently reset an existing driver's 'Company Car'
-    back to the default 'Own Car'. That silent reset on every later
-    upload is what was inflating the Own Car count.
-
-    Pass is_placeholder=True only when this row exists SOLELY because some
-    OTHER report (orders/validity/salary/etc) mentioned an ID or name that
-    couldn't be matched to anyone on the actual roster -- these are kept
-    so the associated data isn't lost, but excluded from headcount/status/
-    vehicle KPI counts elsewhere so those numbers reflect the real roster.
-    A real roster row always clears this flag, even for a driver_id that
-    was previously placeholder-only."""
+    carries a real value for it."""
     existing_vehicle = conn.execute(
         "SELECT vehicle_type FROM drivers WHERE driver_id = ?", (row["driver_id"],)
     ).fetchone()
     vehicle_type = row.get("vehicle_type") or (existing_vehicle[0] if existing_vehicle else None) or "Own Car"
-    is_placeholder = 1 if row.get("is_placeholder") else 0
 
     conn.execute(
         """
         INSERT INTO drivers
             (driver_id, driver_name, phone, supervisor_name, status,
-             vehicle_type, join_date, termination_date, iqama_number,
-             sponsor_name, is_placeholder)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             vehicle_type, join_date, termination_date, iqama_number, sponsor_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(driver_id) DO UPDATE SET
             driver_name       = excluded.driver_name,
             phone             = COALESCE(NULLIF(excluded.phone, ''), drivers.phone),
@@ -1028,32 +957,25 @@ def upsert_driver(conn: sqlite3.Connection, row: dict) -> None:
             join_date         = COALESCE(NULLIF(excluded.join_date, ''), drivers.join_date),
             termination_date  = excluded.termination_date,
             iqama_number      = COALESCE(NULLIF(excluded.iqama_number, ''), drivers.iqama_number),
-            sponsor_name      = COALESCE(NULLIF(excluded.sponsor_name, ''), drivers.sponsor_name),
-            is_placeholder    = CASE WHEN excluded.is_placeholder = 0 THEN 0 ELSE drivers.is_placeholder END
+            sponsor_name      = COALESCE(NULLIF(excluded.sponsor_name, ''), drivers.sponsor_name)
         """,
         (
             row["driver_id"], row["driver_name"], row.get("phone"),
             row.get("supervisor_name"), row.get("status", "Active"),
             vehicle_type, row.get("join_date"),
             row.get("termination_date"), row.get("iqama_number"), row.get("sponsor_name"),
-            is_placeholder,
         ),
     )
 
 
 def upsert_monthly_log(conn: sqlite3.Connection, row: dict) -> None:
-    """Insert a monthly log, or update it if one already exists for that
-    driver + month (idempotent re-upload of the same file is safe). This is
-    the low-level writer -- it always writes every field. For any upload
-    that only carries SOME of the fields (e.g. an orders-only sheet), use
-    merge_monthly_log() instead so untouched fields aren't wiped to zero."""
     conn.execute(
         """
         INSERT INTO monthly_logs
             (driver_id, month_year, total_orders, gross_salary,
              total_deductions, net_salary, validity_status, valid_days_in_month,
-             cancelled_orders, pending_salary)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             cancelled_orders, pending_salary, in_roster)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(driver_id, month_year) DO UPDATE SET
             total_orders        = excluded.total_orders,
             gross_salary         = excluded.gross_salary,
@@ -1062,13 +984,15 @@ def upsert_monthly_log(conn: sqlite3.Connection, row: dict) -> None:
             validity_status         = excluded.validity_status,
             valid_days_in_month      = excluded.valid_days_in_month,
             cancelled_orders          = excluded.cancelled_orders,
-            pending_salary             = excluded.pending_salary
+            pending_salary             = excluded.pending_salary,
+            in_roster                   = excluded.in_roster
         """,
         (
             row["driver_id"], row["month_year"], row["total_orders"],
             row["gross_salary"], row["total_deductions"], row["net_salary"],
             row["validity_status"], row["valid_days_in_month"],
             row.get("cancelled_orders", 0), row.get("pending_salary", 0.0),
+            row.get("in_roster", 0),
         ),
     )
 
@@ -1076,16 +1000,16 @@ def upsert_monthly_log(conn: sqlite3.Connection, row: dict) -> None:
 _MONTHLY_LOG_FIELDS = [
     "total_orders", "cancelled_orders", "gross_salary", "total_deductions",
     "pending_salary", "net_salary", "validity_status", "valid_days_in_month",
+    "in_roster",
 ]
 _MONTHLY_LOG_DEFAULTS = {
     "total_orders": 0, "cancelled_orders": 0, "gross_salary": 0.0,
     "total_deductions": 0.0, "pending_salary": 0.0, "net_salary": 0.0,
-    "validity_status": "Valid", "valid_days_in_month": 0,
+    "validity_status": "Valid", "valid_days_in_month": 0, "in_roster": 0,
 }
 
 
 def get_monthly_log(conn: sqlite3.Connection, driver_id: str, month_year: str):
-    """Fetch the current stored values for one driver+month, or None."""
     row = conn.execute(
         f"SELECT {', '.join(_MONTHLY_LOG_FIELDS)} FROM monthly_logs "
         f"WHERE driver_id = ? AND month_year = ?",
@@ -1097,12 +1021,6 @@ def get_monthly_log(conn: sqlite3.Connection, driver_id: str, month_year: str):
 
 
 def merge_monthly_log(conn: sqlite3.Connection, driver_id: str, month_year: str, updates: dict) -> None:
-    """Apply a PARTIAL set of updates to a driver's monthly log, preserving
-    every field the caller didn't mention. Pass None (or simply omit a key)
-    for any field this particular upload doesn't know about -- e.g. an
-    orders-report upload should pass cancelled_orders=None, not 0, so a
-    later cancellations-report upload for the same month doesn't get wiped
-    out, and vice versa."""
     existing = get_monthly_log(conn, driver_id, month_year) or dict(_MONTHLY_LOG_DEFAULTS)
     merged = dict(existing)
     for key, value in updates.items():
@@ -1136,7 +1054,6 @@ SPONSORS = ["Tamkeen Est.", "Al Faisal Trading", "Rawabi Sponsorship", "Gulf Lin
 
 
 def _random_driver_pool(n: int) -> list:
-    """Generate n unique realistic driver names."""
     pool = set()
     while len(pool) < n:
         pool.add(f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}")
@@ -1144,10 +1061,6 @@ def _random_driver_pool(n: int) -> list:
 
 
 def seed_sample_data() -> None:
-    """Wipe existing data and populate the DB with realistic demo records:
-    a mix of Active/Terminated/Suspended drivers, Company/Own cars, IQAMA
-    numbers, sponsors, and 4 months of payroll history including cancelled
-    orders and pending-salary amounts."""
     conn = get_connection()
     cur = conn.cursor()
 
@@ -1233,7 +1146,6 @@ def seed_sample_data() -> None:
 
 
 def clear_all_data() -> None:
-    """Danger-zone helper: wipes both tables completely."""
     conn = get_connection()
     conn.execute("DELETE FROM monthly_logs;")
     conn.execute("DELETE FROM drivers;")
@@ -1265,19 +1177,16 @@ def load_monthly_logs() -> pd.DataFrame:
 
 
 def load_merged() -> pd.DataFrame:
-    """Drivers joined to their monthly logs (left join, so drivers with no
-    logs yet for any month still appear). A blank supervisor is normalized
-    to 'Unassigned' so those drivers stay visible in every filter instead
-    of silently vanishing (a real gap in uploaded roster files)."""
     conn = get_connection()
     df = pd.read_sql_query(
         """
         SELECT d.driver_id, d.driver_name, d.phone, d.supervisor_name,
                d.status, d.vehicle_type, d.join_date, d.termination_date,
-               d.iqama_number, d.sponsor_name, d.is_placeholder,
+               d.iqama_number, d.sponsor_name,
                m.log_id, m.month_year, m.total_orders, m.gross_salary,
                m.total_deductions, m.net_salary, m.validity_status,
-               m.valid_days_in_month, m.cancelled_orders, m.pending_salary
+               m.valid_days_in_month, m.cancelled_orders, m.pending_salary,
+               m.in_roster
         FROM drivers d
         LEFT JOIN monthly_logs m ON d.driver_id = m.driver_id
         """,
@@ -1285,6 +1194,7 @@ def load_merged() -> pd.DataFrame:
     )
     conn.close()
     df["supervisor_name"] = df["supervisor_name"].fillna(UNASSIGNED).replace("", UNASSIGNED)
+    df["in_roster"] = df["in_roster"].fillna(0).astype(int)
     return df
 
 
@@ -1298,8 +1208,6 @@ def distinct_months() -> list:
 
 
 def month_display(ym: str) -> str:
-    """Turn 'YYYY-MM' into a human-readable 'Month YYYY' label (e.g.
-    '2026-04' -> 'April 2026') for anywhere a month is shown to the person."""
     if not ym:
         return "N/A"
     try:
@@ -1390,7 +1298,6 @@ def render_sidebar():
 
 
 def apply_filters(df: pd.DataFrame, filters: dict, month_scoped: bool = True) -> pd.DataFrame:
-    """Apply the shared sidebar filters to a merged drivers+logs dataframe."""
     out = df.copy()
     if filters["supervisors"]:
         out = out[out["supervisor_name"].isin(filters["supervisors"])]
@@ -1416,14 +1323,6 @@ def render_dashboard(filters: dict):
         st.info("No data available yet. Use **Seed Sample Data** in the sidebar or upload a file.")
         return
 
-    # Placeholder drivers (created only because some report -- orders,
-    # validity, salary, etc -- mentioned an ID/name that didn't match
-    # anyone on the actual roster) must not inflate headcount/active/
-    # vehicle-type counts. Their order/salary data is still usable
-    # elsewhere (Rider Lookup, Financial totals); this only affects "how
-    # many riders are there" style KPI cards.
-    roster_source = merged[merged["is_placeholder"] == 0]
-
     all_months = distinct_months()
     if all_months:
         oldest, newest = min(all_months), max(all_months)
@@ -1436,46 +1335,51 @@ def render_dashboard(filters: dict):
             f"~{span_years:.1f} year(s) of data on file)."
         )
 
-    roster = roster_source.drop_duplicates(subset="driver_id")
+    roster = merged.drop_duplicates(subset="driver_id")
     roster_filtered = roster[
         roster["supervisor_name"].isin(filters["supervisors"])
         & roster["vehicle_type"].isin(filters["vehicle_types"])
     ]
 
-    month_df = roster_source[roster_source["month_year"] == filters["month"]] if filters["month"] else roster_source.iloc[0:0]
+    month_df = merged[merged["month_year"] == filters["month"]] if filters["month"] else merged.iloc[0:0]
     month_df = month_df[
         month_df["supervisor_name"].isin(filters["supervisors"])
         & month_df["vehicle_type"].isin(filters["vehicle_types"])
     ]
-    money_df = merged[merged["month_year"] == filters["month"]] if filters["month"] else merged.iloc[0:0]
-    money_df = money_df[
-        money_df["supervisor_name"].isin(filters["supervisors"])
-        & money_df["vehicle_type"].isin(filters["vehicle_types"])
-    ]
 
     if filters["month"]:
-        # Scoped to THIS month's own records -- not the all-time roster --
-        # so picking a different month shows that month's own headcount
-        # instead of a number that only ever grows across uploads.
+        # Scoped to THIS month's own records, and further scoped to
+        # in_roster==1 -- riders actually listed in this month's
+        # roster/active-rider sheet. An orders/validity/attendance sheet
+        # can reference IDs the roster sheet never had (typos, a
+        # different numbering scheme); those get their data recorded
+        # too, but they must not inflate headcount beyond what the
+        # roster sheet itself says.
         month_roster = month_df.drop_duplicates(subset="driver_id")
-        total_headcount = month_roster["driver_id"].nunique()
-        active_drivers = (month_roster["status"] == "Active").sum()
-        suspended_drivers = int((month_roster["status"] == "Suspended").sum())
+        roster_only = month_roster[month_roster["in_roster"] == 1]
+        total_headcount = roster_only["driver_id"].nunique()
+        # "Active" requires BOTH an employment status that isn't
+        # Terminated/Suspended AND real activity this month (days
+        # worked or orders completed) -- see _active_mask(). A roster's
+        # own status column is often blank/unreliable on its own, so a
+        # rider who's simply listed with no attendance/orders data at
+        # all no longer counts as Active by default.
+        active_drivers = int(roster_only[_active_mask(roster_only)]["driver_id"].nunique())
+        suspended_drivers = int((roster_only["status"] == "Suspended").sum())
+        terminated_this_month = int((roster_only["status"] == "Terminated").sum())
     else:
         total_headcount = len(roster_filtered)
         active_drivers = (roster_filtered["status"] == "Active").sum()
         suspended_drivers = int((roster_filtered["status"] == "Suspended").sum())
+        terminated_this_month = 0
 
-    terminated_this_month = 0
-    if filters["month"]:
-        term_mask = (
-            roster_filtered["status"].eq("Terminated")
-            & roster_filtered["termination_date"].fillna("").str.startswith(filters["month"])
-        )
-        terminated_this_month = int(term_mask.sum())
-
-    company_cars = (month_df["vehicle_type"] == "Company Car").sum()
-    own_cars = (month_df["vehicle_type"] == "Own Car").sum()
+    # Vehicle type only ever comes from the roster sheet itself, so these
+    # are scoped to in_roster==1 too -- otherwise a placeholder driver
+    # created from an unmatched orders/validity row (which has no real
+    # vehicle info) silently defaults to "Own Car" and skews the count.
+    roster_only_for_vehicle = month_df[month_df["in_roster"] == 1].drop_duplicates(subset="driver_id")
+    company_cars = (roster_only_for_vehicle["vehicle_type"] == "Company Car").sum()
+    own_cars = (roster_only_for_vehicle["vehicle_type"] == "Own Car").sum()
     valid_drivers = (month_df["validity_status"] == "Valid").sum()
     invalid_drivers = (month_df["validity_status"] == "Invalid").sum()
 
@@ -1483,13 +1387,13 @@ def render_dashboard(filters: dict):
 
     stat_cards([
         {"icon": "\U0001F465", "label": "Total Headcount", "value": total_headcount,
-         "tip": "Drivers with a record for the selected month", "variant": "a"},
+         "tip": "Riders listed in this month's roster/active-rider sheet", "variant": "a"},
         {"icon": "\U0001F7E2", "label": "Active Drivers", "value": int(active_drivers),
-         "tip": "Currently active, not terminated or suspended", "variant": "a"},
+         "tip": "Not terminated/suspended, and shows orders or days worked this month", "variant": "a"},
         {"icon": "\U0001F6D1", "label": "Terminated (this month)", "value": terminated_this_month,
-         "tip": "Ending date falls within the selected month", "variant": "c"},
+         "tip": "Marked Terminated in this month's uploaded roster", "variant": "c"},
         {"icon": "\u23F8\uFE0F", "label": "Suspended Drivers", "value": suspended_drivers,
-         "tip": "Temporarily suspended, not terminated", "variant": "d"},
+         "tip": "Temporarily suspended / on leave, not terminated", "variant": "d"},
     ])
 
     stat_cards([
@@ -1504,13 +1408,13 @@ def render_dashboard(filters: dict):
     ])
 
     stat_cards([
-        {"icon": "\U0001F4E6", "label": "Total Orders (month)", "value": f"{int(money_df['total_orders'].sum()):,}",
+        {"icon": "\U0001F4E6", "label": "Total Orders (month)", "value": f"{int(month_df['total_orders'].sum()):,}",
          "tip": "Sum of all completed orders this month", "variant": "a"},
-        {"icon": "\u274C", "label": "Cancelled Orders (month)", "value": f"{int(money_df['cancelled_orders'].sum()):,}",
+        {"icon": "\u274C", "label": "Cancelled Orders (month)", "value": f"{int(month_df['cancelled_orders'].sum()):,}",
          "tip": "Orders cancelled across the whole team", "variant": "c"},
-        {"icon": "\U0001F4B5", "label": "Gross Salary (month)", "value": f"Rs {money_df['gross_salary'].sum():,.0f}",
+        {"icon": "\U0001F4B5", "label": "Gross Salary (month)", "value": f"SAR {month_df['gross_salary'].sum():,.0f}",
          "tip": "Total pay before deductions", "variant": "b"},
-        {"icon": "\u23F3", "label": "Pending Salary (month)", "value": f"Rs {money_df['pending_salary'].sum():,.0f}",
+        {"icon": "\u23F3", "label": "Pending Salary (month)", "value": f"SAR {month_df['pending_salary'].sum():,.0f}",
          "tip": "Amount still owed, not yet paid out", "variant": "d"},
     ])
 
@@ -1589,11 +1493,11 @@ def render_financials(filters: dict):
     if summary_row and (summary_row[0] is not None or summary_row[1] is not None):
         company_total, tax_amount, invoice_amount = summary_row
         stat_cards([
-            {"icon": "\U0001F4B0", "label": "Total Money Received", "value": f"Rs {(company_total or 0):,.2f}",
+            {"icon": "\U0001F4B0", "label": "Total Money Received", "value": f"SAR {(company_total or 0):,.2f}",
              "tip": "Company-level total payable amount for this billing cycle", "variant": "a"},
-            {"icon": "\U0001F9FE", "label": "Tax Amount", "value": f"Rs {(tax_amount or 0):,.2f}",
+            {"icon": "\U0001F9FE", "label": "Tax Amount", "value": f"SAR {(tax_amount or 0):,.2f}",
              "tip": "Tax amount for this billing cycle, from the salary summary sheet", "variant": "c"},
-            {"icon": "\U0001F4C4", "label": "Invoice Amount", "value": f"Rs {(invoice_amount or 0):,.2f}",
+            {"icon": "\U0001F4C4", "label": "Invoice Amount", "value": f"SAR {(invoice_amount or 0):,.2f}",
              "tip": "Invoiced amount for this billing cycle", "variant": "b"},
         ])
     else:
@@ -1604,13 +1508,13 @@ def render_financials(filters: dict):
         )
 
     stat_cards([
-        {"icon": "\U0001F4B5", "label": "Gross Salary", "value": f"Rs {total_gross:,.0f}",
+        {"icon": "\U0001F4B5", "label": "Gross Salary", "value": f"SAR {total_gross:,.0f}",
          "tip": "Total pay before deductions", "variant": "b"},
-        {"icon": "\u2796", "label": "Deductions", "value": f"Rs {total_deductions:,.0f}",
+        {"icon": "\u2796", "label": "Deductions", "value": f"SAR {total_deductions:,.0f}",
          "tip": "Total amounts deducted this month", "variant": "c"},
-        {"icon": "\u2705", "label": "Net Salary", "value": f"Rs {total_net:,.0f}",
+        {"icon": "\u2705", "label": "Net Salary", "value": f"SAR {total_net:,.0f}",
          "tip": "Gross minus deductions", "variant": "a"},
-        {"icon": "\u23F3", "label": "Pending Salary", "value": f"Rs {total_pending:,.0f}",
+        {"icon": "\u23F3", "label": "Pending Salary", "value": f"SAR {total_pending:,.0f}",
          "tip": "Still owed, not yet paid out", "variant": "d"},
     ])
 
@@ -1656,14 +1560,6 @@ def render_financials(filters: dict):
 # ==============================================================================
 # TAB 3: BULK EXCEL / CSV UPLOAD  (flexible column-mapping engine)
 # ==============================================================================
-#
-# Real-world operations exports rarely match a fixed schema -- headers vary
-# ("Courier ID" vs "driver_id"), some files are roster-only (no payroll
-# columns at all), dates come in mixed formats, and numeric IDs can arrive
-# as floats in scientific notation. Instead of forcing a rigid template,
-# this tab lets the user MAP their file's actual columns onto our internal
-# fields via dropdowns (with smart auto-guessed defaults), and gracefully
-# skips anything that isn't provided.
 
 NONE_OPTION = "\u2014 None / not in this file \u2014"
 
@@ -1729,13 +1625,6 @@ _GENERIC_HEADER_STOPWORDS = {"total", "amount", "sum", "value", "grand total", "
 
 
 def _guess_column(columns: list, aliases: list) -> str:
-    """Return the best-matching source column for a field, or NONE_OPTION.
-    A bare, ultra-generic header like "Total" or "Amount" is excluded from
-    the fuzzy substring fallback -- it would otherwise fuzzy-match almost
-    any alias list (a deduction sheet's "Total", a validity sheet's
-    "Total", an orders sheet's "Total" all look identical by header name
-    alone), silently misclassifying entire sheets. Exact matches are still
-    allowed even for these words."""
     normed = {c: _normalize_header(c) for c in columns}
     for col, norm in normed.items():
         if norm in aliases:
@@ -1779,11 +1668,6 @@ def _build_template_csv() -> bytes:
 
 
 def _clean_number_value(v, as_int: bool = False):
-    """Robustly parse a numeric cell that may contain commas ('1,234'),
-    currency symbols ('Rs 45,000', '$320'), stray whitespace, a blank, or
-    placeholder text ('N/A', '-'). Returns 0 (never raises) for anything
-    that isn't recognizably a number, so one messy cell can't silently
-    drop an entire row's totals out of the count."""
     if pd.isna(v):
         return 0 if as_int else 0.0
     if isinstance(v, (int, float)):
@@ -1805,13 +1689,6 @@ def _clean_number_value(v, as_int: bool = False):
 
 
 def _clean_id_value(v) -> str:
-    """Turn IDs that arrived as floats (e.g. 1.761062e+15 from Excel) into
-    clean strings without scientific notation or trailing .0. Also
-    normalizes case/whitespace (upper + strip) so the SAME rider's ID
-    matches across different sheets/files even if one export wrote it as
-    'drv-1001' and another as 'DRV-1001' -- a mismatch here used to
-    silently create a duplicate 'Unknown Rider' placeholder and make the
-    real driver's orders show up as zero."""
     if pd.isna(v):
         return ""
     if isinstance(v, float):
@@ -1822,8 +1699,6 @@ def _clean_id_value(v) -> str:
 
 
 def _clean_date_value(v):
-    """Normalize a date cell (Timestamp, datetime, or assorted string
-    formats) into 'YYYY-MM-DD'. Returns None if empty/unparseable-safe."""
     if pd.isna(v):
         return None
     if isinstance(v, (pd.Timestamp, datetime)):
@@ -1840,10 +1715,6 @@ def _clean_date_value(v):
 
 
 def _clean_month_value(v) -> str:
-    """Normalize a payroll-month cell into 'YYYY-MM' regardless of how it
-    arrived (a full date, 'July 2026', '07/2026', '2026-07-01', etc.) so
-    uploaded months always line up with the sidebar's Month filter instead
-    of silently creating a mismatched, invisible month."""
     if pd.isna(v):
         return ""
     if isinstance(v, (pd.Timestamp, datetime)):
@@ -1852,13 +1723,13 @@ def _clean_month_value(v) -> str:
     if not s or s.lower() in ("nan", "nat"):
         return ""
     if len(s) == 7 and s[4] == "-":
-        return s  # already YYYY-MM
+        return s
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%B %Y", "%b %Y", "%b-%y", "%m/%Y", "%Y/%m", "%B-%y"):
         try:
             return datetime.strptime(s, fmt).strftime("%Y-%m")
         except ValueError:
             continue
-    return s  # fall back to the raw text rather than dropping the row
+    return s
 
 
 _MONTH_NAME_TO_NUM = {
@@ -1870,10 +1741,6 @@ _MONTH_NAME_TO_NUM = {
 
 
 def _infer_month_from_filename(filename: str) -> str:
-    """Best-effort guess at the payroll month from a filename like
-    'JULY_TAMKEEN_ACTIVE_RIDERS.xlsx' or 'Payroll_2026-07.csv'. Returns
-    'YYYY-MM' if a month name/number and (optionally) a year could be
-    found, else an empty string so the caller can fall back sensibly."""
     name = filename.rsplit(".", 1)[0]
     lower = name.lower().replace("-", "_").replace(" ", "_")
     tokens = lower.split("_")
@@ -1895,11 +1762,6 @@ def _infer_month_from_filename(filename: str) -> str:
 
 
 def _clean_vehicle_type(v):
-    """Returns 'Company Car' / 'Own Car' when the cell clearly says so, or
-    None when we can't tell (blank cell or unrecognized text). Callers
-    must NOT turn that None into a guessed 'Own Car' themselves -- let
-    upsert_driver() decide, so a blank cell in one upload doesn't silently
-    overwrite a driver's real vehicle type from an earlier upload."""
     if pd.isna(v):
         return None
     s = str(v).strip().lower()
@@ -1920,11 +1782,6 @@ def _slugify_name_to_id(name: str) -> str:
 
 
 def _process_upload_mapped(df: pd.DataFrame, mapping: dict, default_month: str, include_payroll: bool):
-    """Import a dataframe using a user-confirmed column mapping.
-    `mapping` maps our internal field name -> the source column name in df,
-    or NONE_OPTION if that field wasn't provided in the file.
-    Returns (success_count, errors)."""
-
     def col(field):
         src = mapping.get(field, NONE_OPTION)
         return src if src != NONE_OPTION else None
@@ -1959,11 +1816,6 @@ def _process_upload_mapped(df: pd.DataFrame, mapping: dict, default_month: str, 
             id_col = col("driver_id")
             driver_id = _clean_id_value(raw[id_col]) if id_col else ""
             if driver_id and driver_id not in known_driver_ids:
-                # This row's ID doesn't match anyone in the roster -- before
-                # treating it as a brand-new rider, check if the NAME on
-                # this row matches an existing roster rider (different ID
-                # scheme, typo, etc.). Matching by name here is what stops
-                # the same person being counted twice under two IDs.
                 name_match = _fuzzy_match_name_to_id(name_to_id, driver_name)
                 if name_match:
                     driver_id = name_match
@@ -2078,9 +1930,6 @@ def _process_upload_mapped(df: pd.DataFrame, mapping: dict, default_month: str, 
 
 
 def _unnamed_ratio(columns) -> float:
-    """Fraction of column names that look like pandas' auto-generated
-    'Unnamed: N' placeholder -- a strong signal that the real header row
-    was one row lower than where we read from."""
     if len(columns) == 0:
         return 1.0
     unnamed = sum(1 for c in columns if str(c).strip().lower().startswith("unnamed"))
@@ -2088,12 +1937,6 @@ def _unnamed_ratio(columns) -> float:
 
 
 def _read_excel_smart(file_obj, sheet_name):
-    """Read an Excel sheet, automatically picking whichever of header
-    row 0 or row 1 produces cleaner column names. Many real-world report
-    exports (like multi-week attendance/order sheets) have a merged title
-    row above the actual column headers, which otherwise turns every
-    column into a useless 'Unnamed: N'. Falls back gracefully if the sheet
-    is too short to even have a second header row."""
     file_obj.seek(0)
     df0 = pd.read_excel(file_obj, sheet_name=sheet_name, header=0)
 
@@ -2106,7 +1949,7 @@ def _read_excel_smart(file_obj, sheet_name):
 
     if _unnamed_ratio(df1.columns) < _unnamed_ratio(df0.columns):
         df1.columns = [str(c).strip() for c in df1.columns]
-        return df1, 2  # human-friendly: "row 2"
+        return df1, 2
     df0.columns = [str(c).strip() for c in df0.columns]
     return df0, 1
 
@@ -2114,51 +1957,77 @@ def _read_excel_smart(file_obj, sheet_name):
 # ==============================================================================
 # WHOLE-WORKBOOK AUTO-IMPORT (every sheet, auto-classified)
 # ==============================================================================
-# Real operations exports often split one month's data across many sheets --
-# a roster, a day-by-day order count, a day-by-day validity grid, a
-# day-by-day attendance grid, a cancellation log, plus other sheets that
-# aren't relevant to payroll at all (shift schedules, accident reports...).
-# Rather than making the person pick one sheet at a time, this pipeline
-# reads every sheet, figures out what KIND of data it holds by inspecting
-# its columns and sample values, and merges everything it recognizes into
-# one row per driver per month -- skipped sheets are reported clearly so
-# nothing silently vanishes.
 
 VALIDITY_TOKENS = {"VALID", "INVALID"}
 ATTENDANCE_TOKENS = {"P", "OFF", "A", "ABSENT", "PRESENT", "OFFDAY", "OFF DAY", "LEAVE"}
 
 SUMMARY_ROW_TOKENS = {"total", "totals", "grand total", "grand totals", "sum", "overall", "subtotal"}
 
+# Legend/footer rows some report sheets tack on below the real rider rows,
+# e.g. "TOTAL VAID  93", "TOTAL INVALID  3", "CATAEGORY A  28" -- these put
+# a summary label in the driver_id/name column and a plain COUNT (not that
+# rider's data) next to it. Matched by cell PREFIX (not just exact token)
+# so typos like "VAID" for "VALID" or "CATAEGORY" for "CATEGORY" still hit,
+# since the point is the label shape, not exact spelling.
+_SUMMARY_ROW_PREFIX_RE = re.compile(r"^(total|grand\s*total|subtotal|overall|sum|cat\w*gory)\b", re.I)
+
 
 def _row_is_summary(raw_row) -> bool:
-    """True if a spreadsheet row is a 'Total' / 'Grand Total' row rather
-    than a real driver row. These rows sometimes leave the name/ID cells
-    genuinely blank (already skipped elsewhere), but sometimes carry a
-    leftover label or stray value in one of those cells -- if that
-    happens, the row's already-summed number gets counted as if it were
-    one MORE driver's orders on top of everyone already counted, inflating
-    the month's total above the real figure."""
     for v in raw_row:
         if pd.isna(v):
             continue
         s = str(v).strip().lower()
         if s in SUMMARY_ROW_TOKENS or "grand total" in s:
             return True
+        if _SUMMARY_ROW_PREFIX_RE.match(s):
+            return True
     return False
+
+
+# ---- Section-header status markers (roster sheets that group riders by a
+# free-text label row -- e.g. "TERMINATE FOR THIS MONTH", "ON VOCATION" --
+# instead of a per-row status/ending-date column) --------------------------
+#
+# Real roster exports often look like:
+#   [96 normal rider rows]
+#   [blank rows]
+#   TERMINATE FOR THIS MONTH        <- everything below this, until the
+#   [11 rider rows]                    next marker or end of sheet, is
+#   [blank rows]                       Terminated -- NOT a per-row value.
+#   ON VOCATION
+#   [1 rider row]
+#
+# Without recognizing this, every one of those riders silently defaults to
+# "Active" (the only fallback when no status/ending-date column exists),
+# which is what made Active == Total Headcount and Terminated == 0 even
+# though the file clearly lists terminated/on-leave riders.
+_SECTION_STATUS_MARKERS = [
+    (re.compile(r"terminat", re.I), "Terminated"),
+    (re.compile(r"vacation|vocation", re.I), "Suspended"),
+    (re.compile(r"suspend", re.I), "Suspended"),
+    (re.compile(r"\bon\s*leave\b", re.I), "Suspended"),
+    (re.compile(r"^\s*active\s*$", re.I), "Active"),
+]
+
+
+def _detect_status_section_marker(raw_row):
+    """If this row is a section-header label (very few filled cells, and
+    the text matches a known status word) return the status that should
+    apply to every rider row that follows, until the next marker. Returns
+    None for an ordinary rider row (or a blank spacer row)."""
+    non_null = [str(v).strip() for v in raw_row if pd.notna(v) and str(v).strip() != ""]
+    if not non_null or len(non_null) > 2:
+        return None
+    joined = " ".join(non_null)
+    for pattern, status in _SECTION_STATUS_MARKERS:
+        if pattern.search(joined):
+            return status
+    return None
 
 
 # ==============================================================================
 # SALARY WORKBOOK UPLOAD  (separate from the roster/orders/validity upload)
 # ==============================================================================
-# The monthly salary export (e.g. "Feb_salary_main_sheet.xlsx") has its own
-# distinct layout: a per-rider sheet (headers change slightly month to
-# month -- "JAN SALARY " vs "riderDetail") with columns like Courier ID,
-# Total payable amount, TOTAL DEDUCTION, FINAL SALARY, PENDING; and a
-# one-row company-summary sheet ("partnerDetail") with Tax Amount and
-# Total payable amount at the company level. This uses EXACT column-name
-# matching only (no fuzzy substring fallback) -- "Deduction" (one line
-# item) and "TOTAL DEDUCTION" (the actual total) are both real columns in
-# this file, and a substring match would confuse the two.
 
 SALARY_DETAIL_ALIASES = {
     "driver_id": ["courier id"],
@@ -2179,9 +2048,6 @@ SALARY_SUMMARY_ALIASES = {
 
 
 def _guess_column_exact(columns: list, aliases: list) -> str:
-    """Like _guess_column, but EXACT normalized match only -- no substring
-    fallback. Use this whenever similarly-named columns in the same sheet
-    (e.g. 'Deduction' vs 'TOTAL DEDUCTION') could otherwise be confused."""
     normed = {c: _normalize_header(c) for c in columns}
     for col, norm in normed.items():
         if norm in aliases:
@@ -2203,8 +2069,6 @@ def _ensure_salary_summary_table(conn) -> None:
 
 
 def _classify_salary_sheet(df: pd.DataFrame) -> str:
-    """Returns 'salary_detail' (per-rider), 'salary_summary' (one-row
-    company total), or 'unrecognized'."""
     cols = list(df.columns)
     has_courier_id = _guess_column_exact(cols, SALARY_DETAIL_ALIASES["driver_id"]) != NONE_OPTION
     has_final_salary = _guess_column_exact(cols, SALARY_DETAIL_ALIASES["final_salary"]) != NONE_OPTION
@@ -2219,8 +2083,6 @@ def _classify_salary_sheet(df: pd.DataFrame) -> str:
 
 
 def _extract_salary_detail(df: pd.DataFrame, default_month: str):
-    """Returns (rows, id_to_name) -- rows is a list of per-rider salary
-    update dicts ready for merge_monthly_log."""
     cols = list(df.columns)
     id_col = _guess_column_exact(cols, SALARY_DETAIL_ALIASES["driver_id"])
     name_col = _guess_column_exact(cols, SALARY_DETAIL_ALIASES["driver_name"])
@@ -2291,10 +2153,6 @@ def _extract_salary_summary(df: pd.DataFrame, default_month: str) -> list:
 
 
 def process_salary_workbook(uploaded_file, default_month: str) -> dict:
-    """Reads every sheet, classifies each as per-rider salary detail,
-    company-level summary, or unrecognized, and merges everything found
-    into monthly_logs (gross_salary/total_deductions/net_salary/
-    pending_salary) plus the salary_summary table for company totals."""
     xls = pd.ExcelFile(uploaded_file)
 
     sheet_report = []
@@ -2346,7 +2204,6 @@ def process_salary_workbook(uploaded_file, default_month: str) -> dict:
                         "driver_id": driver_id,
                         "driver_name": name or f"Unknown Rider ({driver_id})",
                         "status": "Active",
-                        "is_placeholder": True,
                     },
                 )
                 known_driver_ids.add(driver_id)
@@ -2391,12 +2248,6 @@ def process_salary_workbook(uploaded_file, default_month: str) -> dict:
 
 
 def _day_number_columns(columns) -> list:
-    """Columns representing one calendar day each -- either literally
-    named '1'..'31' (a plain day-of-month grid), OR an actual date value
-    like '2026-05-01' or '2026-05-01 00:00:00' (common when the sheet's
-    real header row uses full dates instead of bare day numbers). Both
-    layouts are used interchangeably by validity/attendance/order-count
-    report sheets, so both must be recognized the same way."""
     out = []
     for c in columns:
         s = str(c).strip()
@@ -2418,57 +2269,22 @@ def _day_number_columns(columns) -> list:
 
 
 def _classify_sheet(df: pd.DataFrame) -> str:
-    """Return one of: 'roster', 'orders', 'validity', 'attendance',
-    'cancellation', or 'unrecognized'."""
     cols = list(df.columns)
 
     has_name = _guess_column(cols, FIELD_ALIASES["driver_name"]) != NONE_OPTION
     id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
     has_id = id_col != NONE_OPTION
 
-    # A roster sheet is distinguished from OTHER Courier-ID+Name sheets
-    # (accident logs, equipment/petrol-card logs, order reports -- all of
-    # which legitimately carry the same ID/name columns as the roster,
-    # since they're exports from the same rider database) by genuine
-    # vehicle-assignment evidence: either a column literally headed
-    # "Vehicle Type" etc, OR -- since many real exports bury this info in
-    # a generically-named column like "Status" -- a column whose ACTUAL
-    # VALUES are overwhelmingly literal "Own Car"/"Company Car" text.
-    # A loose "any column with 'plate' in its name" or "any column named
-    # something like 'status'" check used to be enough to trigger this,
-    # but both of those show up on plenty of non-roster sheets too (an
-    # accident log's "Plate_No", an equipment log's workflow "STATUS")
-    # and were silently corrupting driver records -- most damagingly, an
-    # accident/equipment sheet's own "Date"/"Ending Date" column (about
-    # the incident or the equipment task, not the RIDER) getting read as
-    # that rider's termination date and marking active people "Terminated".
     has_vehicle_hint = _guess_column(cols, FIELD_ALIASES["vehicle_type"]) != NONE_OPTION
     if not has_vehicle_hint and has_name and has_id:
         name_col = _guess_column(cols, FIELD_ALIASES["driver_name"])
-        content_col = _find_vehicle_type_column_by_content(df, {id_col, name_col})
-        if content_col is not None and _vehicle_type_content_ratio(df, content_col) >= 0.9:
+        detected_col, _mode = _detect_vehicle_source_column(df, {id_col, name_col})
+        if detected_col is not None:
             has_vehicle_hint = True
 
-    # Roster is checked FIRST, before the orders-column shortcut below. A
-    # roster export that also happens to carry an orders-like column (e.g.
-    # a "Total Trips" summary column) must NOT be misclassified as a
-    # dedicated orders sheet -- doing so used to add its numbers a second
-    # time on top of the real orders sheet elsewhere in the same workbook,
-    # which is what caused totals to come out doubled.
     if has_name and has_id and has_vehicle_hint:
         return "roster"
 
-    # Day-by-day grid sheets (columns literally named '1'..'31') are
-    # classified by their CELL CONTENT, not by any header name -- this is
-    # checked before the generic total_orders header check below because a
-    # day-by-day ORDER COUNT grid often has nothing but a vague "Total"
-    # column for its header, which is deliberately excluded from fuzzy
-    # header matching (see _GENERIC_HEADER_STOPWORDS) to stop it from
-    # mis-tagging validity/deduction/other sheets as "orders". Content is
-    # the reliable signal here: mostly VALID/INVALID -> validity; mostly
-    # P/OFF/ABSENT-style attendance tokens -> attendance; mostly plain
-    # numbers (daily order counts, with some "OFF"/"NO SHIFT" text on
-    # non-working days) -> orders.
     day_cols = _day_number_columns(cols)
     if len(day_cols) >= 15:
         sample = set()
@@ -2492,10 +2308,6 @@ def _classify_sheet(df: pd.DataFrame) -> str:
     if _guess_column(cols, FIELD_ALIASES["total_orders"]) != NONE_OPTION:
         lower_cols = [str(c).strip().lower() for c in cols]
         if any("need more" in c or "shift time" in c for c in lower_cols):
-            # A target/coaching-tracker sheet (e.g. "TARGET B RIDERS") --
-            # its ORDERS column is an interim snapshot for a subset of
-            # riders, not the authoritative monthly total. Summing it in
-            # alongside the real order report double-counts those riders.
             return "unrecognized"
         return "orders"
 
@@ -2506,75 +2318,136 @@ def _classify_sheet(df: pd.DataFrame) -> str:
     return "unrecognized"
 
 
-def _vehicle_type_content_ratio(df: pd.DataFrame, col) -> float:
-    """Fraction of a column's actual values that are literally 'Own Car' /
-    'Company Car' text."""
-    vals = df[col].dropna().astype(str).str.strip().str.upper()
+_OWN_VEHICLE_RE = re.compile(r"\bown\s*(?:car|bike|vehicle|moto|scooter)\b", re.I)
+_COMPANY_CAR_RE = re.compile(r"\bcompany\s*car\b", re.I)
+
+
+def _detect_vehicle_source_column(df: pd.DataFrame, exclude: set):
+    """Find whichever column actually carries Own-vs-Company-vehicle
+    info, in EITHER of two real shapes seen across different months'
+    files:
+
+      'label' -- the column literally spells out 'Company Car' / 'Own
+      Car' for nearly every row (some months reuse a column called
+      'STATUS' for this, even though it has nothing to do with driver
+      employment status). Read each value directly.
+
+      'plate' -- the column is really a plate-number field (header
+      'PLATE NUMBER' in every file that uses this shape): a rider on
+      their own vehicle gets 'OWN CAR'/'OWN BIKE' text, a rider on a
+      company-assigned vehicle gets an actual plate string or a rental/
+      owner note like '(RENT)', '(TAMKEEN)', '(SALEEM)' -- so ANY
+      non-blank value that isn't an 'own' mention means Company Car, by
+      elimination. Barely any literal 'company car' text is what tells
+      this shape apart from 'label' columns -- relying on a fixed
+      column NAME here breaks the moment a file renames it, which is
+      why this is detected from cell content instead.
+
+    Returns (column, mode), or (None, None) if nothing reliable enough
+    is found."""
+    best_plate = None  # (col, own_hits)
+    for col in df.columns:
+        if col in exclude:
+            continue
+        vals = df[col].dropna().astype(str).str.strip()
+        vals = vals[vals != ""]
+        total = len(vals)
+        if total < 5:
+            continue
+        upper = vals.str.upper()
+        own_hits = int(upper.str.contains(_OWN_VEHICLE_RE).sum())
+        company_hits = int(upper.str.contains(_COMPANY_CAR_RE).sum())
+        label_ratio = (own_hits + company_hits) / total
+
+        if label_ratio >= 0.85 and company_hits >= max(3, total * 0.1):
+            return col, "label"
+
+        if own_hits >= 3 and company_hits == 0:
+            non_own = vals[~upper.str.contains(_OWN_VEHICLE_RE)]
+            if len(non_own) == 0:
+                continue
+            # The remainder should look like short plate/rental tokens,
+            # not free-form prose (e.g. a termination-reason column also
+            # has no 'company car' text, but its values are sentences).
+            platish = (non_own.str.len() <= 30).sum()
+            if platish / len(non_own) >= 0.7:
+                if best_plate is None or own_hits > best_plate[1]:
+                    best_plate = (col, own_hits)
+
+    if best_plate:
+        return best_plate[0], "plate"
+    return None, None
+
+
+def _resolve_vehicle_type(raw_value, mode: str):
+    """Read one cell's vehicle type given the column's detected mode
+    (see _detect_vehicle_source_column). Returns None (leave unchanged)
+    when the cell is blank or, in 'label' mode, doesn't recognizably say
+    either type."""
+    if pd.isna(raw_value):
+        return None
+    s = str(raw_value).strip()
+    if not s:
+        return None
+    if mode == "label":
+        return _clean_vehicle_type(s)
+    # mode == "plate": presence of a real plate/rental value (anything
+    # that isn't an "own vehicle" mention) means a company-assigned car.
+    return "Own Car" if _OWN_VEHICLE_RE.search(s.upper()) else "Company Car"
+
+
+def _vehicle_column_confidence(df: pd.DataFrame, col) -> float:
+    """Fraction of a column's values that are recognizable own/company
+    vehicle text -- used only to sanity-check a column found by HEADER
+    NAME (e.g. an explicit 'Vehicle Type' header) before trusting it."""
+    if col == NONE_OPTION:
+        return 0.0
+    vals = df[col].dropna().astype(str).str.strip()
+    vals = vals[vals != ""]
     if vals.empty:
         return 0.0
-    sample = vals.head(60)
-    hits = sample.apply(lambda s: "OWN CAR" in s or "COMPANY CAR" in s).sum()
-    return hits / len(sample)
+    upper = vals.str.upper()
+    hits = (upper.str.contains(_OWN_VEHICLE_RE) | upper.str.contains(_COMPANY_CAR_RE)).sum()
+    return hits / len(vals)
 
 
-def _column_looks_like_vehicle_type(df: pd.DataFrame, col) -> bool:
-    """True if most of a column's actual values are literally 'Own Car' /
-    'Company Car' -- REGARDLESS of what the column header says. Real
-    exports sometimes reuse a header like 'Status' for the vehicle
-    assignment instead of a proper 'Vehicle Type' column, so relying on
-    the header name alone misses it and every driver silently defaults to
-    'Own Car'."""
-    if col == NONE_OPTION:
+_REASON_TEXT_HINTS = (
+    "terminat", "close date", "restrict", "violation", "sponsership",
+    "sponsorship", "without permission", "not working", "changed spons",
+)
+
+
+def _looks_like_reason_text(s: str) -> bool:
+    """True if a 'last name' cell is actually a termination-reason note
+    (e.g. 'Terminate, without permission off ID / close date...') rather
+    than a real surname -- these sheets sometimes reuse the Last Name
+    column to record why someone was let go. Folding that straight into
+    driver_name produces garbage like 'SANA ULLAH Terminate, without
+    permission off ID / close ...', so such text is dropped instead of
+    appended."""
+    if not s:
         return False
-    return _vehicle_type_content_ratio(df, col) >= 0.9
+    low = s.lower()
+    if len(s) > 25:
+        return True
+    return any(hint in low for hint in _REASON_TEXT_HINTS)
 
 
-def _find_vehicle_type_column_by_content(df: pd.DataFrame, exclude_cols: set):
-    """Scan every column NOT already claimed by another field and pick the
-    one with the HIGHEST own-car/company-car match ratio (not just the
-    first one crossing a threshold) -- a 'Plate Number' column that only
-    sometimes reads 'Own Car' (for riders with no plate) must lose out to
-    a dedicated column that reads 'Own Car'/'Company Car' on every row."""
-    best_col, best_ratio = None, 0.0
-    for c in df.columns:
-        if c in exclude_cols:
-            continue
-        ratio = _vehicle_type_content_ratio(df, c)
-        if ratio > best_ratio:
-            best_col, best_ratio = c, ratio
-    return best_col if best_ratio >= 0.5 else None
-
-
-_SECTION_STATUS_KEYWORDS = [
-    (["terminat"], "Terminated"),
-    (["vacation", "vocation", "on leave", "leave"], "Suspended"),
-    (["suspend"], "Suspended"),
-    (["active rider", "back to active", "reactivat"], "Active"),
-]
-
-
-def _section_status_label(raw_row):
-    """Real-world roster sheets sometimes pack THREE lists into one sheet:
-    the active roster, then a 'TERMINATE FOR THIS MONTH' label followed by
-    terminated riders, then an 'ON VOCATION' label followed by suspended
-    riders -- with no per-row status column at all, just these section
-    headers. A section-header row has exactly ONE filled cell in the
-    entire row (a label, not driver data); a real driver row always has
-    several (at minimum an ID and a name). Returns the status that should
-    apply to rows AFTER this one, or None if this isn't a section header."""
-    texts = [str(v).strip() for v in raw_row if not (isinstance(v, float) and pd.isna(v)) and str(v).strip()]
-    if len(texts) != 1:
-        return None
-    label = texts[0].lower()
-    for keywords, status in _SECTION_STATUS_KEYWORDS:
-        if any(k in label for k in keywords):
-            return status
-    return None
-
-
-def _extract_roster(df: pd.DataFrame, default_month: str = None) -> dict:
+def _extract_roster(df: pd.DataFrame, month_year: str = None) -> dict:
     """driver_id -> roster fields dict, plus a name->id lookup for later
-    name-based matching (used by the cancellation sheet, which has no ID)."""
+    name-based matching (used by the cancellation sheet, which has no ID).
+
+    Rows are walked IN ORDER so that free-text section-header rows (e.g.
+    "TERMINATE FOR THIS MONTH", "ON VOCATION") can be detected and applied
+    to every rider row that follows, until the next marker -- see
+    _detect_status_section_marker(). An explicit status/ending-date value
+    on a row always wins over the section it happens to sit in.
+
+    month_year (the payroll month this whole sheet is being imported for)
+    is used ONLY to backfill termination_date when a section marker says
+    "Terminated" but the row's own Ending Date cell is blank -- otherwise
+    that rider would be correctly marked Terminated yet never counted in
+    the "Terminated (this month)" tile, which keys off termination_date."""
     cols = list(df.columns)
     id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
     name_col = _guess_column(cols, FIELD_ALIASES["driver_name"])
@@ -2589,38 +2462,31 @@ def _extract_roster(df: pd.DataFrame, default_month: str = None) -> dict:
     join_col = _guess_column(cols, FIELD_ALIASES["join_date"])
     end_col = _guess_column(cols, FIELD_ALIASES["termination_date"])
 
-    # Content beats header name for vehicle type: even when a column was
-    # found BY HEADER NAME, also check every other column's actual values.
-    # If some other column is (almost) entirely literal 'Own Car'/'Company
-    # Car' text, that's unambiguous ground truth and wins -- a header-name
-    # guess can point at the wrong column (e.g. a generic "Type" column
-    # that isn't actually vehicle type at all), but real 'Own Car'/
-    # 'Company Car' text in a column can't lie about what it is.
     exclude = {id_col, name_col, first_col, last_col, phone_col, sup_col,
                sponsor_col, iqama_col, join_col, end_col}
-    content_veh_col = _find_vehicle_type_column_by_content(df, exclude)
-    if content_veh_col is not None and content_veh_col != veh_col:
-        content_ratio = _vehicle_type_content_ratio(df, content_veh_col)
-        header_ratio = _vehicle_type_content_ratio(df, veh_col) if veh_col != NONE_OPTION else 0.0
-        if content_ratio >= 0.9 and content_ratio > header_ratio:
-            veh_col = content_veh_col
+    header_veh_col = veh_col  # an explicit "Vehicle Type"-named header, if any
+    veh_mode = "label"
+    detected_col, detected_mode = _detect_vehicle_source_column(df, exclude)
+    if detected_col is not None and detected_col != header_veh_col:
+        # A column that actually LOOKS like real vehicle info by its
+        # values wins over a header-name guess whose own content doesn't
+        # back it up (e.g. a "Vehicle" column that turned out blank/junk).
+        header_confidence = _vehicle_column_confidence(df, header_veh_col) if header_veh_col != NONE_OPTION else 0.0
+        if header_confidence < 0.5:
+            veh_col, veh_mode = detected_col, detected_mode
     if veh_col != NONE_OPTION and status_col == veh_col:
         # Whatever we ended up using for vehicle type isn't really a
         # driver-status column -- don't feed vehicle-type text into status.
         status_col = NONE_OPTION
-    elif _column_looks_like_vehicle_type(df, status_col):
-        # A dedicated vehicle-type column exists, but the "status" column
-        # ALSO turned out to be vehicle-type text (not a real Active/
-        # Terminated status) -- don't let it feed driver status either.
-        status_col = NONE_OPTION
 
     records = {}
-    section_status = "Active"
+    current_section_status = None  # set by a section-header row, applies until the next one
     for _, raw in df.iterrows():
-        detected_section = _section_status_label(raw)
-        if detected_section is not None:
-            section_status = detected_section
-            continue  # this row is a label ("TERMINATE FOR THIS MONTH"), not a rider
+        marker = _detect_status_section_marker(raw)
+        if marker:
+            current_section_status = marker
+            continue
+
         if _row_is_summary(raw):
             continue
         if name_col != NONE_OPTION:
@@ -2628,10 +2494,19 @@ def _extract_roster(df: pd.DataFrame, default_month: str = None) -> dict:
         elif first_col != NONE_OPTION or last_col != NONE_OPTION:
             f = "" if first_col == NONE_OPTION or pd.isna(raw[first_col]) else str(raw[first_col]).strip()
             l = "" if last_col == NONE_OPTION or pd.isna(raw[last_col]) else str(raw[last_col]).strip()
+            if _looks_like_reason_text(l):
+                l = ""
             name = f"{f} {l}".strip()
         else:
             name = ""
         if not name or name.lower() == "nan":
+            continue
+        if re.fullmatch(r"[\d.\-eE]+", name):
+            # A malformed/shifted sheet (columns off by one, headers on
+            # the wrong row) can make the NAME column resolve to what's
+            # actually the Courier ID -- e.g. name ends up as
+            # '1767086760257579.0'. A real person's name is never just
+            # digits, so this row is unusable rather than a real rider.
             continue
 
         driver_id = _clean_id_value(raw[id_col]) if id_col != NONE_OPTION else ""
@@ -2640,18 +2515,21 @@ def _extract_roster(df: pd.DataFrame, default_month: str = None) -> dict:
 
         termination_date = _clean_date_value(raw[end_col]) if end_col != NONE_OPTION else None
         status_val = str(raw[status_col]).strip() if status_col != NONE_OPTION and not pd.isna(raw[status_col]) else ""
-        if section_status != "Active":
-            # A section header ("TERMINATE FOR THIS MONTH", "ON VOCATION")
-            # is an explicit, deliberate signal from whoever built the
-            # sheet -- it overrides the column-based guess below. If the
-            # sheet didn't also give an explicit date, anchor it to the
-            # month being imported so "Terminated (this month)" on the
-            # dashboard (which keys off termination_date) still counts it.
-            status = section_status
-            if not termination_date and default_month:
-                termination_date = f"{default_month}-01"
+        if status_val in DRIVER_STATUSES:
+            status = status_val
+        elif termination_date:
+            status = "Terminated"
+        elif current_section_status:
+            status = current_section_status
         else:
-            status = status_val if status_val in DRIVER_STATUSES else ("Terminated" if termination_date else "Active")
+            status = "Active"
+
+        if status == "Terminated" and not termination_date and month_year:
+            # The section said "Terminated" but this row's own Ending Date
+            # cell was blank -- fall back to the 1st of the upload month so
+            # this rider still counts in that month's "Terminated" tile
+            # instead of silently vanishing from it.
+            termination_date = f"{month_year}-01"
 
         records[driver_id] = {
             "driver_id": driver_id,
@@ -2660,7 +2538,7 @@ def _extract_roster(df: pd.DataFrame, default_month: str = None) -> dict:
             "supervisor_name": None if sup_col == NONE_OPTION or pd.isna(raw[sup_col]) else str(raw[sup_col]).strip(),
             "sponsor_name": None if sponsor_col == NONE_OPTION or pd.isna(raw[sponsor_col]) else str(raw[sponsor_col]).strip(),
             "iqama_number": None if iqama_col == NONE_OPTION else (_clean_id_value(raw[iqama_col]) or None),
-            "vehicle_type": _clean_vehicle_type(raw[veh_col]) if veh_col != NONE_OPTION else None,
+            "vehicle_type": _resolve_vehicle_type(raw[veh_col], veh_mode) if veh_col != NONE_OPTION else None,
             "status": status,
             "join_date": _clean_date_value(raw[join_col]) if join_col != NONE_OPTION else None,
             "termination_date": termination_date,
@@ -2669,10 +2547,6 @@ def _extract_roster(df: pd.DataFrame, default_month: str = None) -> dict:
 
 
 def _extract_orders(df: pd.DataFrame):
-    """Returns (orders_dict, id_to_name) -- driver_id -> total_orders
-    (summed if a driver appears twice WITHIN this same sheet), plus
-    whatever name was sitting next to each ID so a later ID mismatch can
-    be resolved by NAME instead of guessing from the ID itself."""
     cols = list(df.columns)
     id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
     orders_col = _guess_column(cols, FIELD_ALIASES["total_orders"])
@@ -2695,11 +2569,6 @@ def _extract_orders(df: pd.DataFrame):
         if orders_col != NONE_OPTION:
             row_total = _clean_number_value(raw[orders_col], as_int=True)
         else:
-            # No single "Total Orders" column -- this is a day-by-day grid
-            # (columns named 1..31) holding a daily order count per day,
-            # with text like "OFF"/"NO SHIFT"/"ABSENT" on non-working days.
-            # Sum whichever cells are actually numbers; non-numeric cells
-            # contribute 0 rather than breaking the row.
             row_total = sum(_clean_number_value(raw[c], as_int=True) for c in day_cols)
         out[driver_id] = out.get(driver_id, 0) + row_total
         if name_col != NONE_OPTION and not pd.isna(raw[name_col]):
@@ -2710,13 +2579,6 @@ def _extract_orders(df: pd.DataFrame):
 
 
 def _orders_dicts_look_like_duplicates(a: dict, b: dict) -> bool:
-    """True when two per-sheet {driver_id: total_orders} maps look like the
-    SAME report saved under two different sheet names (e.g. a monthly
-    total re-pasted into a second tab) rather than genuinely different data
-    (e.g. two separate weeks) that should be added together. We only treat
-    them as duplicates when they share a large chunk of drivers AND those
-    shared drivers carry near-identical values -- a real second week of
-    orders would share the driver list but NOT the values."""
     common = set(a) & set(b)
     if not common or len(common) < max(1, min(len(a), len(b)) // 2):
         return False
@@ -2725,9 +2587,6 @@ def _orders_dicts_look_like_duplicates(a: dict, b: dict) -> bool:
 
 
 def _extract_validity(df: pd.DataFrame):
-    """Returns (validity_dict, id_to_name): driver_id -> {'valid_days': n,
-    'invalid_days': n, 'status': str}, plus each row's name for later
-    name-based ID resolution."""
     cols = list(df.columns)
     id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
     name_col = _guess_column(cols, FIELD_ALIASES["driver_name"])
@@ -2758,9 +2617,6 @@ def _extract_validity(df: pd.DataFrame):
 
 
 def _extract_attendance(df: pd.DataFrame):
-    """Returns (attendance_dict, id_to_name): driver_id -> days_worked
-    (count of 'P' cells across the day columns), plus each row's name for
-    later name-based ID resolution."""
     cols = list(df.columns)
     id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
     name_col = _guess_column(cols, FIELD_ALIASES["driver_name"])
@@ -2785,8 +2641,6 @@ def _extract_attendance(df: pd.DataFrame):
 
 
 def _extract_cancellations_by_name(df: pd.DataFrame) -> dict:
-    """normalized driver name -> cancelled order count (this report has no
-    driver ID, only a name, so it's matched against the roster afterwards)."""
     cols = list(df.columns)
     name_col = None
     for c in cols:
@@ -2815,17 +2669,6 @@ _COMMON_NAME_TOKENS = {
 
 
 def _fuzzy_match_name_to_id(name_to_id: dict, target_name: str):
-    """Match a transactional-log name (often abbreviated, e.g. 'MD UDDIN')
-    against the roster's full names (e.g. 'MD MARUF UDDIN') by requiring at
-    least 2 shared MEANINGFUL words -- catches real matches that an exact-
-    string comparison misses. Extremely common South-Asian name prefixes
-    ('MD', 'MOHAMMAD', 'SYED', ...) are excluded from that word count: two
-    DIFFERENT riders both named 'MD KARIM ...' would otherwise share 'MD' +
-    one more word and get incorrectly merged into a single rider, mixing
-    their orders together. If fewer than 2 meaningful words remain after
-    removing those prefixes, we deliberately do NOT guess -- a missed
-    match (left as a separate 'Unknown Rider' you can fix by hand) is far
-    safer than silently combining two different people's data."""
     target_upper = target_name.strip().upper()
     if target_upper in name_to_id:
         return name_to_id[target_upper]
@@ -2846,14 +2689,6 @@ def _fuzzy_match_name_to_id(name_to_id: dict, target_name: str):
 
 
 def _remap_ids_by_name(id_dict: dict, id_to_name: dict, name_to_id: dict, known_ids: set) -> dict:
-    """When a report sheet's ID column uses a different numbering scheme
-    than the roster (or has a typo), matching by ID alone creates a
-    duplicate 'Unknown Rider' entry for a person who already exists in the
-    roster -- so that rider's orders/validity/attendance get counted
-    twice: once under their real driver_id, once under the mismatched one.
-    This resolves any key that ISN'T already a known driver_id by matching
-    the NAME that sat next to it in the sheet against the roster (fuzzy,
-    same logic used for the cancellation report) -- never by phone."""
     if not id_dict:
         return id_dict
     remapped = {}
@@ -2872,19 +2707,36 @@ def _remap_ids_by_name(id_dict: dict, id_to_name: dict, name_to_id: dict, known_
     return remapped
 
 
+_ROSTER_NAME_HINTS = ("active", "main", "employee", "rider", "driver")
+
+
+def _score_roster_candidate(sheet_name: str, df: pd.DataFrame) -> float:
+    """Rank how likely a sheet is to be the REAL master roster, when a
+    workbook has more than one sheet that looks roster-shaped (e.g. a
+    proper 'Active Rider' sheet plus an old backup/working copy like
+    'RUF' that's mostly blank/'Unnamed' columns, or two near-duplicate
+    snapshots like 'SHIFT TIMING' vs 'MIAN DATA'). Higher score wins.
+    Real, filled-in Courier IDs matter most; a wall of 'Unnamed: N'
+    columns (a stray/legend sheet, not a real export) is penalized hard;
+    a sheet name that reads like an actual roster gets a small nudge."""
+    cols = list(df.columns)
+    id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
+    valid_ids = int(df[id_col].apply(lambda v: bool(_clean_id_value(v))).sum()) if id_col != NONE_OPTION else 0
+    unnamed_penalty = _unnamed_ratio(cols) * 100
+    name_bonus = 15 if any(h in sheet_name.lower() for h in _ROSTER_NAME_HINTS) else 0
+    return valid_ids - unnamed_penalty + name_bonus
+
+
 def process_workbook_all_sheets(uploaded_file, month_year: str):
-    """Read every sheet in the workbook, classify each one, and merge
-    everything recognized into unified driver + monthly_log records.
-    Returns a summary dict for display plus the usual (success_count, errors)."""
     xls = pd.ExcelFile(uploaded_file)
 
-    roster_records = {}
-    orders_sheets = []  # list of (sheet_name, {driver_id: total_orders}) -- combined AFTER the loop
+    roster_candidates = []  # [(sheet_name, df)] -- resolved to ONE roster after the loop
+    orders_sheets = []
     validity_by_id = {}
     attendance_by_id = {}
     cancellations_by_name = {}
-    id_to_name = {}  # driver_id -> name, gathered from every report sheet, used to resolve ID mismatches
-    sheet_report = []  # (sheet_name, classification, row_count)
+    id_to_name = {}
+    sheet_report = []
 
     for sheet_name in xls.sheet_names:
         try:
@@ -2903,7 +2755,7 @@ def process_workbook_all_sheets(uploaded_file, month_year: str):
         sheet_report.append((sheet_name, kind, len(df)))
 
         if kind == "roster":
-            roster_records.update(_extract_roster(df, month_year))
+            roster_candidates.append((sheet_name, df))
         elif kind == "orders":
             orders_dict, names = _extract_orders(df)
             orders_sheets.append((sheet_name, orders_dict))
@@ -2920,11 +2772,43 @@ def process_workbook_all_sheets(uploaded_file, month_year: str):
             for k, v in _extract_cancellations_by_name(df).items():
                 cancellations_by_name[k] = cancellations_by_name.get(k, 0) + v
 
-    # Combine the "orders"-classified sheets. Sheets whose driver->orders
-    # values are near-identical to a sheet we already kept are treated as
-    # the SAME report duplicated across tabs and skipped, instead of being
-    # added a second time (the root cause of totals coming out doubled).
-    # Genuinely different sheets (e.g. separate weeks) are still summed.
+    # Resolve to ONE primary roster when a workbook has several
+    # roster-shaped sheets (a real 'Active Rider' sheet plus a stray
+    # backup/working copy, or two overlapping snapshots). Merging every
+    # one blindly used to inflate headcount by however many extra riders
+    # the lower-quality sheet(s) added -- e.g. a mostly-blank 427-row
+    # leftover sheet nearly doubling a real 89-rider roster. The
+    # highest-scoring sheet (see _score_roster_candidate) is used as-is;
+    # any OTHER roster-shaped sheet only contributes riders whose ID
+    # isn't already in the primary sheet, so a genuinely unique rider
+    # sitting only in a secondary sheet still isn't lost.
+    roster_records = {}
+    roster_sheet_used = None
+    roster_sheets_skipped = []
+    extra_riders_from_skipped = 0
+    if roster_candidates:
+        scored = sorted(
+            ((_score_roster_candidate(name, df), name, df) for name, df in roster_candidates),
+            key=lambda t: -t[0],
+        )
+        roster_sheet_used = scored[0][1]
+        roster_records = _extract_roster(scored[0][2], month_year)
+        for _score, name, df in scored[1:]:
+            roster_sheets_skipped.append(name)
+            # Only trust a lower-ranked sheet enough to pull EXTRA riders
+            # from it when it's itself a clean, real export (mostly named
+            # columns) -- a mangled/shifted sheet like a stray working
+            # copy with a wall of 'Unnamed: N' columns produces garbage
+            # rows (Courier ID misread as the rider's name, etc.) that
+            # would just add phantom "riders" rather than real ones.
+            if _unnamed_ratio(list(df.columns)) >= 0.3:
+                continue
+            secondary = _extract_roster(df, month_year)
+            for did, rec in secondary.items():
+                if did not in roster_records:
+                    roster_records[did] = rec
+                    extra_riders_from_skipped += 1
+
     orders_by_id = {}
     duplicate_orders_sheets = []
     kept_orders_sheets = []
@@ -2945,11 +2829,6 @@ def process_workbook_all_sheets(uploaded_file, month_year: str):
         upsert_driver(conn, record)
     conn.commit()
 
-    # Resolve any report key that ISN'T already a known driver_id by
-    # matching its NAME against the roster instead (fuzzy, same approach
-    # as the cancellation report) -- this is what stops a rider from being
-    # counted once under their real driver_id and AGAIN under a mismatched
-    # ID from a report sheet that numbers riders differently.
     all_drivers_df = load_drivers()
     known_driver_ids = set(all_drivers_df["driver_id"])
     name_to_id = dict(zip(all_drivers_df["driver_name"].str.strip().str.upper(), all_drivers_df["driver_id"]))
@@ -2958,8 +2837,6 @@ def process_workbook_all_sheets(uploaded_file, month_year: str):
     validity_by_id = _remap_ids_by_name(validity_by_id, id_to_name, name_to_id, known_driver_ids)
     attendance_by_id = _remap_ids_by_name(attendance_by_id, id_to_name, name_to_id, known_driver_ids)
 
-    # Resolve name-based cancellations against the FULL roster on file
-    # (including drivers from earlier uploads), using fuzzy word matching.
     cancellations_by_id = {}
     unmatched_names = 0
     for name_key, count in cancellations_by_name.items():
@@ -2969,21 +2846,11 @@ def process_workbook_all_sheets(uploaded_file, month_year: str):
         else:
             unmatched_names += 1
 
-    # Every driver that appeared ANYWHERE in this workbook (roster included)
-    # gets a monthly presence record for this month -- even an all-zero one
-    # for a roster-only entry -- so "how many drivers this month" reflects
-    # exactly who was in THIS file, not the all-time roster.
     all_driver_ids = (
         set(orders_by_id) | set(validity_by_id) | set(attendance_by_id)
         | set(cancellations_by_id) | set(roster_records)
     )
 
-    # A driver_id can show up in ORDER REPORT / VALIDTY REPORT / etc. without
-    # ever appearing in the roster sheet (different sheet, slightly different
-    # export, a rider who left before the roster snapshot was taken...). The
-    # monthly_logs table requires a matching drivers row to exist first, so
-    # anyone not already known gets a minimal placeholder profile here --
-    # better than losing their payroll data to a crash.
     known_ids = set(
         r[0] for r in conn.execute("SELECT driver_id FROM drivers").fetchall()
     )
@@ -2997,7 +2864,6 @@ def process_workbook_all_sheets(uploaded_file, month_year: str):
                 "driver_id": driver_id,
                 "driver_name": f"Unknown Rider ({driver_id})",
                 "status": "Active",
-                "is_placeholder": True,
             },
         )
         placeholders_created += 1
@@ -3015,7 +2881,7 @@ def process_workbook_all_sheets(uploaded_file, month_year: str):
             validity_status = val["status"]
         elif att_days is not None:
             valid_days_in_month = att_days
-            validity_status = None  # attendance alone doesn't tell us pass/fail validity
+            validity_status = None
         else:
             valid_days_in_month = None
             validity_status = None
@@ -3033,6 +2899,13 @@ def process_workbook_all_sheets(uploaded_file, month_year: str):
                 "net_salary": None,
                 "validity_status": validity_status,
                 "valid_days_in_month": valid_days_in_month,
+                # Only ever SET this true (this rider is confirmed on
+                # the roster sheet for this month) -- never pass 0/False
+                # here, or a rider correctly marked in_roster by an
+                # earlier upload for the same month would get wiped out
+                # by a later upload (e.g. a salary file) that doesn't
+                # carry its own roster sheet.
+                "in_roster": 1 if driver_id in roster_records else None,
             },
         )
         logs_written += 1
@@ -3052,6 +2925,9 @@ def process_workbook_all_sheets(uploaded_file, month_year: str):
         "logs_written": logs_written,
         "placeholders_created": placeholders_created,
         "duplicate_orders_sheets": duplicate_orders_sheets,
+        "roster_sheet_used": roster_sheet_used,
+        "roster_sheets_skipped": roster_sheets_skipped,
+        "extra_riders_from_skipped": extra_riders_from_skipped,
     }
     return summary
 
@@ -3111,7 +2987,10 @@ def _render_operations_upload():
                 "and merged into one record per rider, regardless of how many sheets there are. "
                 "Sheets that don't match a known pattern (schedules, accident logs, etc.) are "
                 "safely skipped and listed below so nothing is silently lost. If two sheets "
-                "contain the same orders data under different names, only one is counted."
+                "contain the same orders data under different names, only one is counted. "
+                "Section labels inside a roster sheet (e.g. 'TERMINATE FOR THIS MONTH', "
+                "'ON VOCATION') are also recognized -- every rider listed under one is "
+                "tagged with that status automatically."
             )
             inferred_month = _infer_month_from_filename(uploaded_file.name) or datetime.today().strftime("%Y-%m")
             month_year = st.text_input(
@@ -3150,6 +3029,19 @@ def _render_operations_upload():
                             f"({summary['cancellations_unmatched']} names in the cancellation log couldn't "
                             f"be matched to a roster rider and were skipped)."
                         )
+                    if summary["roster_sheets_skipped"]:
+                        extra_note = (
+                            f" {summary['extra_riders_from_skipped']} rider(s) unique to the skipped "
+                            f"sheet(s) were still merged in."
+                            if summary["extra_riders_from_skipped"] else " No riders were lost."
+                        )
+                        st.info(
+                            f"\u2139\uFE0F This workbook had more than one roster-shaped sheet -- used "
+                            f"**{summary['roster_sheet_used']}** as the main roster (most complete match) "
+                            f"and treated {', '.join(summary['roster_sheets_skipped'])} as a duplicate/backup "
+                            f"copy instead of merging it in wholesale (that used to inflate headcount)."
+                            + extra_note
+                        )
                     if summary["placeholders_created"]:
                         st.warning(
                             f"\u26A0\uFE0F {summary['placeholders_created']} rider(s) appeared in the orders/"
@@ -3182,7 +3074,6 @@ def _render_operations_upload():
         _render_single_sheet_upload(uploaded_file, sheet_name)
         return
 
-    # Plain CSV -- always the single-table flow.
     _render_single_sheet_upload(uploaded_file, None)
 
 
@@ -3256,9 +3147,6 @@ def _render_salary_upload():
 
 
 def _render_single_sheet_upload(uploaded_file, sheet_name):
-    """The original column-mapping flow for a single table (one Excel sheet
-    or a CSV) -- kept as the manual/advanced path, and still the only path
-    for plain CSVs and single-sheet workbooks."""
     try:
         if sheet_name is not None:
             raw_df, header_row_used = _read_excel_smart(uploaded_file, sheet_name)
@@ -3380,12 +3268,6 @@ def _render_single_sheet_upload(uploaded_file, sheet_name):
 
 
 def render_month_reveal_cards(rows: pd.DataFrame, join_date: str, vehicle_type: str):
-    """Render one animated card per month of history for a rider -- each
-    card fades/slides in with a small staggered delay so the reveal feels
-    like an animation rather than a plain table dump. Join date and
-    vehicle type are driver-level facts, repeated on every card so they're
-    visible alongside each month's figures without having to scroll back
-    up to the profile header."""
     css = """
     <style>
       .reveal-grid {
@@ -3436,10 +3318,10 @@ def render_month_reveal_cards(rows: pd.DataFrame, join_date: str, vehicle_type: 
               <div class="reveal-row"><span>Orders</span><b>{row.total_orders}</b></div>
               <div class="reveal-row"><span>Cancelled</span><b>{row.cancelled_orders}</b></div>
               <div class="reveal-row"><span>Days Worked</span><b>{row.valid_days_in_month}</b></div>
-              <div class="reveal-row"><span>Gross</span><b>Rs {row.gross_salary:,.0f}</b></div>
-              <div class="reveal-row"><span>Deductions</span><b>Rs {row.total_deductions:,.0f}</b></div>
-              <div class="reveal-row"><span>Pending</span><b>Rs {row.pending_salary:,.0f}</b></div>
-              <div class="reveal-row"><span>Net</span><b>Rs {row.net_salary:,.0f}</b></div>
+              <div class="reveal-row"><span>Gross</span><b>SAR {row.gross_salary:,.0f}</b></div>
+              <div class="reveal-row"><span>Deductions</span><b>SAR {row.total_deductions:,.0f}</b></div>
+              <div class="reveal-row"><span>Pending</span><b>SAR {row.pending_salary:,.0f}</b></div>
+              <div class="reveal-row"><span>Net</span><b>SAR {row.net_salary:,.0f}</b></div>
               <div class="reveal-row"><span>Joined</span><b>{join_date or 'N/A'}</b></div>
               <div class="reveal-row"><span>Vehicle</span><b>{vehicle_icon} {vehicle_type}</b></div>
               <div class="reveal-badge {badge_class}">{row.validity_status}</div>
@@ -3449,7 +3331,7 @@ def render_month_reveal_cards(rows: pd.DataFrame, join_date: str, vehicle_type: 
     st.markdown(css + "".join(cards) + "</div>", unsafe_allow_html=True)
 
 
-def render_rider_lookup(filters: dict):
+def render_rider_lookup():
     st.subheader("\U0001F50D Rider Lookup")
     st.write("Search by name, ID, IQAMA, or phone -- matching riders update instantly below.")
 
@@ -3527,62 +3409,25 @@ def render_rider_lookup(filters: dict):
         st.info("No monthly logs on file for this rider yet.")
         return
 
-    selected_month = filters.get("month")
-    st.markdown(f"#### \U0001F4C5 {month_display(selected_month)}" if selected_month else "#### This Month")
-
-    if not selected_month:
-        st.caption(
-            "No month is selected in the sidebar filter -- pick one there "
-            "to see this rider's figures for that specific month."
-        )
-    else:
-        month_row = rider_logs[rider_logs["month_year"] == selected_month]
-        if month_row.empty:
-            st.info(f"No log on file for {profile['driver_name']} in {month_display(selected_month)}.")
-        else:
-            r = month_row.iloc[0]
-            stat_cards([
-                {"icon": "\U0001F4E6", "label": "Orders", "value": f"{int(r['total_orders']):,}",
-                 "tip": "Completed orders this month", "variant": "a"},
-                {"icon": "\u274C", "label": "Cancelled", "value": f"{int(r['cancelled_orders']):,}",
-                 "tip": "Cancelled orders this month", "variant": "c"},
-                {"icon": "\U0001F4C5", "label": "Days Worked", "value": int(r["valid_days_in_month"]),
-                 "tip": "Attendance this month", "variant": "b"},
-                {"icon": "\u2705" if r["validity_status"] == "Valid" else "\u274C",
-                 "label": "Validity", "value": r["validity_status"] or "N/A",
-                 "tip": "Validity status for this month", "variant": "a" if r["validity_status"] == "Valid" else "c"},
-            ])
-            stat_cards([
-                {"icon": "\U0001F4B5", "label": "Gross Salary", "value": f"Rs {r['gross_salary']:,.0f}",
-                 "tip": "Before deductions, this month", "variant": "b"},
-                {"icon": "\u2796", "label": "Deductions", "value": f"Rs {r['total_deductions']:,.0f}",
-                 "tip": "Deducted this month", "variant": "c"},
-                {"icon": "\u2705", "label": "Net Salary", "value": f"Rs {r['net_salary']:,.0f}",
-                 "tip": "Gross minus deductions, this month", "variant": "a"},
-                {"icon": "\u23F3", "label": "Pending", "value": f"Rs {r['pending_salary']:,.0f}",
-                 "tip": "Still owed for this month", "variant": "d"},
-            ])
-
-    st.markdown("---")
-    with st.expander("\U0001F4CA Lifetime Totals (all months combined)"):
-        stat_cards([
-            {"icon": "\U0001F4E6", "label": "Total Orders", "value": f"{int(rider_logs['total_orders'].sum()):,}",
-             "tip": "Across every month on file", "variant": "a"},
-            {"icon": "\u274C", "label": "Total Cancelled", "value": f"{int(rider_logs['cancelled_orders'].sum()):,}",
-             "tip": "Cancelled orders, all-time", "variant": "c"},
-            {"icon": "\U0001F4B5", "label": "Total Gross Earned", "value": f"Rs {rider_logs['gross_salary'].sum():,.0f}",
-             "tip": "Before deductions, all-time", "variant": "b"},
-            {"icon": "\u23F3", "label": "Total Pending", "value": f"Rs {rider_logs['pending_salary'].sum():,.0f}",
-             "tip": "Still owed to this rider", "variant": "d"},
-        ])
-        stat_cards([
-            {"icon": "\u2705", "label": "Months Valid", "value": int((rider_logs["validity_status"] == "Valid").sum()),
-             "tip": "Months marked Valid", "variant": "a"},
-            {"icon": "\u274C", "label": "Months Invalid", "value": int((rider_logs["validity_status"] == "Invalid").sum()),
-             "tip": "Months marked Invalid", "variant": "c"},
-            {"icon": "\U0001F4C5", "label": "Total Days Worked", "value": int(rider_logs["valid_days_in_month"].sum()),
-             "tip": "Summed attendance across all months", "variant": "b"},
-        ])
+    st.markdown("#### Lifetime Totals")
+    stat_cards([
+        {"icon": "\U0001F4E6", "label": "Total Orders", "value": f"{int(rider_logs['total_orders'].sum()):,}",
+         "tip": "Across every month on file", "variant": "a"},
+        {"icon": "\u274C", "label": "Total Cancelled", "value": f"{int(rider_logs['cancelled_orders'].sum()):,}",
+         "tip": "Cancelled orders, all-time", "variant": "c"},
+        {"icon": "\U0001F4B5", "label": "Total Gross Earned", "value": f"SAR {rider_logs['gross_salary'].sum():,.0f}",
+         "tip": "Before deductions, all-time", "variant": "b"},
+        {"icon": "\u23F3", "label": "Total Pending", "value": f"SAR {rider_logs['pending_salary'].sum():,.0f}",
+         "tip": "Still owed to this rider", "variant": "d"},
+    ])
+    stat_cards([
+        {"icon": "\u2705", "label": "Months Valid", "value": int((rider_logs["validity_status"] == "Valid").sum()),
+         "tip": "Months marked Valid", "variant": "a"},
+        {"icon": "\u274C", "label": "Months Invalid", "value": int((rider_logs["validity_status"] == "Invalid").sum()),
+         "tip": "Months marked Invalid", "variant": "c"},
+        {"icon": "\U0001F4C5", "label": "Total Days Worked", "value": int(rider_logs["valid_days_in_month"].sum()),
+         "tip": "Summed attendance across all months", "variant": "b"},
+    ])
 
     st.markdown("---")
     st.markdown("#### Month-by-Month History")
@@ -3638,7 +3483,7 @@ def render_supervisor_alerts():
          "tip": f"Below the {low_order_threshold}-order threshold", "variant": "d"},
         {"icon": "\U0001F6AB", "label": "Cancelled Orders", "value": total_cancelled,
          "tip": "Cancelled across the whole team", "variant": "c"},
-        {"icon": "\U0001F4B8", "label": "Total Deductions", "value": f"Rs {total_deductions:,.0f}",
+        {"icon": "\U0001F4B8", "label": "Total Deductions", "value": f"SAR {total_deductions:,.0f}",
          "tip": "Summed across the team this month", "variant": "b"},
     ])
 
@@ -3647,7 +3492,7 @@ def render_supervisor_alerts():
         f"{invalid_count} invalid aur {low_order_count} riders {low_order_threshold} se kam orders par hain."
     )
     line2 = (
-        f"\U0001F4B0 Total deductions is month Rs {total_deductions:,.0f} rahi hain, {total_cancelled} orders cancel huay, "
+        f"\U0001F4B0 Total deductions is month SAR {total_deductions:,.0f} rahi hain, {total_cancelled} orders cancel huay, "
         f"average orders/rider = {avg_orders:.0f}. Kindly low performers ko review karein."
     )
     line3 = (
@@ -3723,7 +3568,7 @@ def main():
     with tab3:
         render_upload_tab()
     with tab4:
-        render_rider_lookup(filters)
+        render_rider_lookup()
     with tab5:
         render_supervisor_alerts()
 
