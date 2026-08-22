@@ -148,21 +148,6 @@ def inject_custom_css():
             gap: 16px;
             margin: 10px 0 18px 0;
           }
-          /* Plain vertical stack, always full column width -- used for
-             the header's 2-card stacks so they don't inherit stat-grid's
-             auto-fit track sizing (which can leave odd empty space when
-             a Streamlit column is narrower than the grid expects). */
-          .stat-col {
-            display: flex;
-            flex-direction: column;
-            gap: 14px;
-          }
-          .stat-col .stat-card2 {
-            width: 100%;
-            max-width: 260px;
-            margin: 0 auto;
-            box-sizing: border-box;
-          }
           .stat-card2 {
             position: relative;
             border-radius: 16px;
@@ -172,7 +157,6 @@ def inject_custom_css():
             animation: fadeInUp 0.5s ease both;
             transition: transform 0.22s cubic-bezier(.2,.8,.3,1.3), box-shadow 0.22s ease;
             cursor: default;
-            text-align: center;
           }
           .stat-card2.v-a { background: linear-gradient(135deg, rgba(34,197,94,0.15), rgba(59,130,246,0.08)); }
           .stat-card2.v-b { background: linear-gradient(135deg, rgba(168,85,247,0.15), rgba(59,130,246,0.08)); }
@@ -187,9 +171,8 @@ def inject_custom_css():
           .stat-label2 {
             font-size: 11.5px; letter-spacing: 1.1px; text-transform: uppercase;
             opacity: 0.64; margin-top: 7px; font-weight: 700;
-            color: var(--text-color);
           }
-          .stat-value2 { font-size: 25px; font-weight: 900; margin-top: 3px; color: var(--text-color); }
+          .stat-value2 { font-size: 25px; font-weight: 900; margin-top: 3px; }
           .stat-tip {
             position: absolute; left: 50%; bottom: calc(100% + 10px);
             transform: translate(-50%, 6px);
@@ -205,6 +188,58 @@ def inject_custom_css():
             border: 6px solid transparent; border-top-color: #111018;
           }
           .stat-card2:hover .stat-tip { opacity: 1; transform: translate(-50%, 0); }
+
+          /* ---- Clickable stat cards: the button itself IS the card
+             (styled to match the original stat-card2 look), so a click
+             always lands on the real control -- no invisible overlay
+             positioning that could go wrong. ---- */
+          div[class*="st-key-clickcard_"] div[data-testid="stButton"] button {
+            width: 100%;
+            min-height: 104px;
+            border-radius: 16px !important;
+            border: 1px solid rgba(255,255,255,0.14) !important;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.10);
+            padding: 14px 10px !important;
+            white-space: pre-line;
+            line-height: 1.5;
+            font-weight: 700;
+            transition: transform 0.22s cubic-bezier(.2,.8,.3,1.3), box-shadow 0.22s ease;
+          }
+          div[class*="st-key-clickcard_"] div[data-testid="stButton"] button:hover {
+            transform: translateY(-6px) scale(1.03);
+            box-shadow: 0 16px 30px rgba(0,0,0,0.22);
+          }
+          div[class*="__va"] div[data-testid="stButton"] button {
+            background: linear-gradient(135deg, rgba(34,197,94,0.18), rgba(59,130,246,0.10)) !important;
+          }
+          div[class*="__vb"] div[data-testid="stButton"] button {
+            background: linear-gradient(135deg, rgba(168,85,247,0.18), rgba(59,130,246,0.10)) !important;
+          }
+          div[class*="__vc"] div[data-testid="stButton"] button {
+            background: linear-gradient(135deg, rgba(239,68,68,0.16), rgba(249,115,22,0.10)) !important;
+          }
+          div[class*="__vd"] div[data-testid="stButton"] button {
+            background: linear-gradient(135deg, rgba(250,204,21,0.18), rgba(34,197,94,0.10)) !important;
+          }
+          div[class*="__active"] div[data-testid="stButton"] button {
+            outline: 2px solid rgba(59,130,246,0.9) !important;
+            box-shadow: 0 0 0 5px rgba(59,130,246,0.18), 0 20px 38px rgba(0,0,0,0.26) !important;
+          }
+
+          /* ---- Drilldown reveal panel (appears under whichever row
+             the clicked card was in) ---- */
+          div[class*="st-key-drill_panel_box"] {
+            border-radius: 16px;
+            padding: 14px 18px 4px 18px;
+            margin: 6px 0 20px 0;
+            border: 1px solid rgba(59,130,246,0.35);
+            background: linear-gradient(135deg, rgba(59,130,246,0.10), rgba(34,197,94,0.06));
+            animation: drillIn 0.32s cubic-bezier(.2,.8,.3,1.15) both;
+          }
+          @keyframes drillIn {
+            from { opacity: 0; transform: translateY(-12px) scaleY(0.97); }
+            to   { opacity: 1; transform: translateY(0) scaleY(1); }
+          }
         </style>
         <div class="app-gradient-bar"></div>
         """,
@@ -233,26 +268,54 @@ def stat_cards(cards: list) -> None:
     st.markdown("".join(html), unsafe_allow_html=True)
 
 
-def stat_cards_column(cards: list) -> None:
-    """Same visual style as stat_cards(), but a plain vertical stack that
-    always fills 100% of its container width -- used inside a narrow
-    Streamlit column (the header's left/right stat pairs), where
-    stat_cards()'s auto-fit grid can size its track oddly and leave an
-    ugly gap instead of stretching to the column's actual width."""
-    html = ['<div class="stat-col">']
-    for c in cards:
+def render_clickable_stat_row(cards: list, row_key: str) -> None:
+    """Real, clickable stat cards -- each card IS an actual Streamlit
+    button (styled via CSS to keep the same gradient/icon/rounded-card
+    look), not a decorative div with a separate invisible button placed
+    behind it. A click always lands on the real control this way --
+    that's the fix for the earlier version, where the invisible overlay
+    button could end up misaligned with the pretty card drawn on top of
+    it and silently eat clicks."""
+    cols = st.columns(len(cards))
+    for i, c in enumerate(cards):
+        card_id = f"{row_key}_{i}"
         variant = c.get("variant", "a")
-        tip_html = f'<div class="stat-tip">{c["tip"]}</div>' if c.get("tip") else ""
-        html.append(
-            f'<div class="stat-card2 v-{variant}">'
-            f'<div class="stat-icon2">{c.get("icon", "")}</div>'
-            f'<div class="stat-label2">{c["label"]}</div>'
-            f'<div class="stat-value2">{c["value"]}</div>'
-            f"{tip_html}"
-            f"</div>"
-        )
-    html.append("</div>")
-    st.markdown("".join(html), unsafe_allow_html=True)
+        is_active = st.session_state.get("active_drill") == card_id
+        label = f"{c.get('icon', '')}\n\n{c['label']}\n\n**{c['value']}**"
+        active_flag = "__active" if is_active else ""
+        with cols[i]:
+            with st.container(key=f"clickcard_{card_id}__v{variant}{active_flag}"):
+                clicked = st.button(label, key=f"clickbtn_{card_id}", use_container_width=True)
+                if c.get("tip"):
+                    st.caption(c["tip"])
+                if clicked:
+                    st.session_state["active_drill"] = None if is_active else card_id
+                    st.rerun()
+
+
+def render_drilldown_panel(drill_defs: dict) -> None:
+    """Shows an animated reveal panel for whichever card the user just
+    clicked (tracked in st.session_state['active_drill']), IF that card
+    belongs to the group currently on screen (drill_defs). drill_defs is
+    {card_id: (title, dataframe, note)} -- always built fresh from
+    whatever month/filters are active, so this works the same for every
+    month, not just one hardcoded snapshot."""
+    active = st.session_state.get("active_drill")
+    if not active or active not in drill_defs:
+        return
+    title, df, note = drill_defs[active]
+    with st.container(key="drill_panel_box"):
+        c1, c2 = st.columns([6, 1])
+        c1.markdown(f"##### \U0001F50E {title}  \u2022  {len(df)} row(s)")
+        if c2.button("\u2715 Close", key="close_drill_btn", use_container_width=True):
+            st.session_state["active_drill"] = None
+            st.rerun()
+        if note:
+            st.caption(note)
+        if df.empty:
+            st.caption("Nothing to show here for the current month/filters.")
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 # ==============================================================================
@@ -665,6 +728,20 @@ def render_header(filters: dict):
             headcount = len(roster_f)
             active = int((roster_f["status"] == "Active").sum())
 
+    # Resolve the real, current theme text color in Python -- rendered
+    # server-side on every rerun, so it's always correct for whichever
+    # theme is active right now. This replaces the old approach of
+    # reading the parent page's computed color via JS from inside the
+    # iframe: that only ran once when the iframe was first mounted, so
+    # switching themes afterward left the OLD color baked in (e.g. white
+    # text captured under dark mode staying white -- and invisible --
+    # after switching to light mode, since Streamlit doesn't always
+    # remount an unchanged iframe on a theme change).
+    theme_base = st.get_option("theme.base") or "light"
+    stat_text_color = st.get_option("theme.textColor") or (
+        "#FAFAFA" if theme_base == "dark" else "#31333F"
+    )
+
     extrusion_layers = ""
     layer_count = 7
     for i in range(layer_count, 0, -1):
@@ -678,38 +755,63 @@ def render_header(filters: dict):
             f"</g>"
         )
 
-    # The 4 headline numbers use the SAME stat_cards() widget as the rest
-    # of the dashboard (rendered via st.markdown, in the same document as
-    # Streamlit) -- so their text color inherits var(--text-color) and
-    # switches with the theme automatically and reliably, the same way
-    # every other card in the app already does. Only the animated 3D logo
-    # (pure graphics, no readability concerns) stays in its own iframe
-    # below, since that's what the scroll-tilt effect needs.
-    col_left, col_mid, col_right = st.columns([1, 1.3, 1], vertical_alignment="center", gap="small")
-    with col_left:
-        stat_cards_column([
-            {"icon": "\U0001F465", "label": "Headcount", "value": headcount,
-             "tip": "Total drivers matching your current filters", "variant": "a"},
-            {"icon": "\U0001F7E2", "label": "Active Drivers", "value": active,
-             "tip": "Currently active, not terminated or suspended", "variant": "a"},
-        ])
-    with col_right:
-        stat_cards_column([
-            {"icon": "\U0001F4E6", "label": "Orders (month)", "value": f"{orders_m:,}",
-             "tip": "Total orders logged for the selected month", "variant": "b"},
-            {"icon": "\U0001F4B0", "label": "Gross (month)", "value": f"SAR {gross_m:,.0f}",
-             "tip": "Total gross salary across all riders this month", "variant": "b"},
-        ])
-
     html = """
     <style>
       .header-row {
         display: flex;
         align-items: center;
         justify-content: center;
+        gap: 30px;
+        flex-wrap: wrap;
         padding: 8px 0 4px 0;
         font-family: Arial, Helvetica, sans-serif;
       }
+      .stat-stack { display: flex; flex-direction: column; gap: 14px; }
+      .stat-card {
+        position: relative;
+        min-width: 210px;
+        text-align: center;
+        padding: 18px 26px;
+        border-radius: 16px;
+        border: 1px solid rgba(120,120,120,0.18);
+        box-shadow: 0 6px 18px rgba(0,0,0,0.12);
+        animation: statPop 0.5s ease both;
+        transition: transform 0.22s cubic-bezier(.2,.8,.3,1.3), box-shadow 0.22s ease;
+      }
+      .stat-card:hover {
+        transform: translateY(-8px) scale(1.05);
+        box-shadow: 0 18px 34px rgba(0,0,0,0.28);
+        z-index: 6;
+      }
+      .stat-card.v-a { background: linear-gradient(135deg, rgba(34,197,94,0.18), rgba(59,130,246,0.10)); }
+      .stat-card.v-b { background: linear-gradient(135deg, rgba(168,85,247,0.18), rgba(59,130,246,0.10)); }
+      .stat-card.v-c { background: linear-gradient(135deg, rgba(239,68,68,0.16), rgba(249,115,22,0.10)); }
+      .stat-card.v-d { background: linear-gradient(135deg, rgba(250,204,21,0.18), rgba(34,197,94,0.10)); }
+      .stat-card .label {
+        font-size: 13px; letter-spacing: 1.4px; text-transform: uppercase;
+        opacity: 0.64; font-weight: 700;
+        color: __STAT_TEXT__;
+      }
+      .stat-card .value {
+        font-size: 32px; font-weight: 900; margin-top: 4px;
+        color: __STAT_TEXT__;
+      }
+      .stat-card .htip {
+        position: absolute; left: 50%; bottom: calc(100% + 10px); transform: translate(-50%, 6px);
+        background: #111018; color: #f3f1ff; padding: 8px 13px; border-radius: 9px; font-size: 11.5px;
+        white-space: nowrap; opacity: 0; pointer-events: none; box-shadow: 0 12px 24px rgba(0,0,0,0.4);
+        transition: opacity 0.18s ease, transform 0.18s ease;
+      }
+      .stat-card .htip::after {
+        content: ""; position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
+        border: 6px solid transparent; border-top-color: #111018;
+      }
+      .stat-card:hover .htip { opacity: 1; transform: translate(-50%, 0); }
+      @keyframes statPop {
+        from { opacity: 0; transform: translateY(10px) scale(0.96); }
+        to   { opacity: 1; transform: translateY(0) scale(1); }
+      }
+
       .logo-stage { perspective: 1800px; }
       .logo-outer {
         position: relative;
@@ -783,6 +885,19 @@ def render_header(filters: dict):
     </style>
 
     <div class="header-row">
+      <div class="stat-stack">
+        <div class="stat-card v-a">
+          <div class="label">Headcount</div>
+          <div class="value">__HEADCOUNT__</div>
+          <div class="htip">Total drivers matching your current filters</div>
+        </div>
+        <div class="stat-card v-b">
+          <div class="label">Active Drivers</div>
+          <div class="value">__ACTIVE__</div>
+          <div class="htip">Currently active, not terminated or suspended</div>
+        </div>
+      </div>
+
       <div class="logo-stage">
         <div class="logo-outer" id="logoOuter">
           <div class="logo-ring r1"></div>
@@ -812,12 +927,32 @@ def render_header(filters: dict):
           <div class="logo-word">TAMKEEN</div>
         </div>
       </div>
+
+      <div class="stat-stack">
+        <div class="stat-card v-c">
+          <div class="label">Orders (month)</div>
+          <div class="value">__ORDERS__</div>
+          <div class="htip">Total orders logged for the selected month</div>
+        </div>
+        <div class="stat-card v-d">
+          <div class="label">Gross (month)</div>
+          <div class="value">__GROSS__</div>
+          <div class="htip">Total gross salary across all riders this month</div>
+        </div>
+      </div>
     </div>
 
     <script>
       (function() {
         try {
           const doc = window.parent.document;
+
+          // Text color is now baked in server-side (see __STAT_TEXT__
+          // above) so it's correct on every render, including right
+          // after a theme switch. This script only handles the
+          // scroll-driven 3D tilt of the logo -- no more reading the
+          // parent page's computed color from here.
+
           const candidates = [
             doc.querySelector('section.main'),
             doc.querySelector('[data-testid="stAppViewContainer"]'),
@@ -840,9 +975,15 @@ def render_header(filters: dict):
       })();
     </script>
     """
-    html = html.replace("__EXTRUSION_LAYERS__", extrusion_layers)
-    with col_mid:
-        components.html(html, height=320)
+    html = (
+        html.replace("__EXTRUSION_LAYERS__", extrusion_layers)
+        .replace("__HEADCOUNT__", str(headcount))
+        .replace("__ACTIVE__", str(active))
+        .replace("__ORDERS__", f"{orders_m:,}")
+        .replace("__GROSS__", f"SAR {gross_m:,.0f}")
+        .replace("__STAT_TEXT__", stat_text_color)
+    )
+    components.html(html, height=320)
 
 
 # ==============================================================================
@@ -1373,8 +1514,35 @@ def render_dashboard(filters: dict):
     invalid_drivers = (month_df["validity_status"] == "Invalid").sum()
 
     st.markdown(f"**Selected Month:** `{month_display(filters['month'])}`")
+    st.caption("\U0001F446 Tap any card below to see exactly which riders make up that number.")
 
-    stat_cards([
+    active_only = roster_only[_active_mask(roster_only)] if not roster_only.empty else roster_only
+    terminated_only = roster_only[roster_only["status"] == "Terminated"]
+    suspended_only = roster_only[roster_only["status"] == "Suspended"]
+    company_car_only = roster_only_for_vehicle[roster_only_for_vehicle["vehicle_type"] == "Company Car"]
+    own_car_only = roster_only_for_vehicle[roster_only_for_vehicle["vehicle_type"] == "Own Car"]
+    valid_only = month_df[month_df["validity_status"] == "Valid"]
+    invalid_only = month_df[month_df["validity_status"] == "Invalid"]
+
+    roster_cols = ["driver_id", "driver_name", "supervisor_name", "status", "vehicle_type"]
+    validity_cols = ["driver_id", "driver_name", "valid_days_in_month", "validity_status"]
+
+    drill_defs = {
+        "row1_0": ("Total Headcount", roster_only[roster_cols].sort_values("driver_name") if not roster_only.empty else roster_only, None),
+        "row1_1": ("Active Drivers", active_only[roster_cols].sort_values("driver_name") if not active_only.empty else active_only, None),
+        "row1_2": ("Terminated (this month)", terminated_only[roster_cols + ["termination_date"]].sort_values("driver_name") if not terminated_only.empty else terminated_only, None),
+        "row1_3": ("Suspended Drivers", suspended_only[roster_cols].sort_values("driver_name") if not suspended_only.empty else suspended_only, None),
+        "row2_0": ("Company Cars (month)", company_car_only[["driver_id", "driver_name", "supervisor_name"]].sort_values("driver_name") if not company_car_only.empty else company_car_only, None),
+        "row2_1": ("Own Cars (month)", own_car_only[["driver_id", "driver_name", "supervisor_name"]].sort_values("driver_name") if not own_car_only.empty else own_car_only, None),
+        "row2_2": ("Valid Drivers (month)", valid_only[validity_cols].sort_values("driver_name") if not valid_only.empty else valid_only, None),
+        "row2_3": ("Invalid Drivers (month)", invalid_only[validity_cols].sort_values("driver_name") if not invalid_only.empty else invalid_only, "These need supervisor follow-up."),
+        "row3_0": ("Total Orders (month)", month_df[["driver_id", "driver_name", "total_orders"]].sort_values("total_orders", ascending=False), None),
+        "row3_1": ("Cancelled Orders (month)", month_df[["driver_id", "driver_name", "cancelled_orders"]].sort_values("cancelled_orders", ascending=False), None),
+        "row3_2": ("Gross Salary (month)", month_df[["driver_id", "driver_name", "gross_salary"]].sort_values("gross_salary", ascending=False), None),
+        "row3_3": ("Pending Salary (month)", month_df[["driver_id", "driver_name", "pending_salary"]].sort_values("pending_salary", ascending=False), None),
+    }
+
+    render_clickable_stat_row([
         {"icon": "\U0001F465", "label": "Total Headcount", "value": total_headcount,
          "tip": "Riders listed in this month's roster/active-rider sheet", "variant": "a"},
         {"icon": "\U0001F7E2", "label": "Active Drivers", "value": int(active_drivers),
@@ -1383,9 +1551,11 @@ def render_dashboard(filters: dict):
          "tip": "Marked Terminated in this month's uploaded roster", "variant": "c"},
         {"icon": "\u23F8\uFE0F", "label": "Suspended Drivers", "value": suspended_drivers,
          "tip": "Temporarily suspended / on leave, not terminated", "variant": "d"},
-    ])
+    ], row_key="row1")
+    if (st.session_state.get("active_drill") or "").startswith("row1_"):
+        render_drilldown_panel(drill_defs)
 
-    stat_cards([
+    render_clickable_stat_row([
         {"icon": "\U0001F697", "label": "Company Cars (month)", "value": int(company_cars),
          "tip": "Riders using a company-provided vehicle", "variant": "b"},
         {"icon": "\U0001F699", "label": "Own Cars (month)", "value": int(own_cars),
@@ -1394,9 +1564,11 @@ def render_dashboard(filters: dict):
          "tip": "Marked Valid for this month's payroll", "variant": "a"},
         {"icon": "\u274C", "label": "Invalid Drivers (month)", "value": int(invalid_drivers),
          "tip": "Marked Invalid -- needs supervisor follow-up", "variant": "c"},
-    ])
+    ], row_key="row2")
+    if (st.session_state.get("active_drill") or "").startswith("row2_"):
+        render_drilldown_panel(drill_defs)
 
-    stat_cards([
+    render_clickable_stat_row([
         {"icon": "\U0001F4E6", "label": "Total Orders (month)", "value": f"{int(month_df['total_orders'].sum()):,}",
          "tip": "Sum of all completed orders this month", "variant": "a"},
         {"icon": "\u274C", "label": "Cancelled Orders (month)", "value": f"{int(month_df['cancelled_orders'].sum()):,}",
@@ -1405,7 +1577,9 @@ def render_dashboard(filters: dict):
          "tip": "Total pay before deductions", "variant": "b"},
         {"icon": "\u23F3", "label": "Pending Salary (month)", "value": f"SAR {month_df['pending_salary'].sum():,.0f}",
          "tip": "Amount still owed, not yet paid out", "variant": "d"},
-    ])
+    ], row_key="row3")
+    if (st.session_state.get("active_drill") or "").startswith("row3_"):
+        render_drilldown_panel(drill_defs)
 
     st.markdown("---")
     st.markdown("#### Filtered Roster Detail")
@@ -3283,8 +3457,8 @@ def render_month_reveal_cards(rows: pd.DataFrame, join_date: str, vehicle_type: 
         from { opacity: 0; transform: translateY(16px) scale(0.97); }
         to   { opacity: 1; transform: translateY(0) scale(1); }
       }
-      .reveal-month { font-weight: 800; font-size: 15px; margin-bottom: 6px; color: var(--text-color); }
-      .reveal-row { display: flex; justify-content: space-between; font-size: 13px; padding: 2px 0; color: var(--text-color); }
+      .reveal-month { font-weight: 800; font-size: 15px; margin-bottom: 6px; }
+      .reveal-row { display: flex; justify-content: space-between; font-size: 13px; padding: 2px 0; }
       .reveal-row span { opacity: 0.7; }
       .reveal-badge {
         display: inline-block; margin-top: 8px; padding: 2px 10px;
@@ -3371,8 +3545,7 @@ def render_rider_lookup(filters: dict):
         f"""
         <div style="border-radius:16px; padding:16px 20px; margin-bottom:10px;
                     background:linear-gradient(135deg, rgba(34,197,94,0.10), rgba(168,85,247,0.08));
-                    border:1px solid rgba(120,120,120,0.18); animation: cardReveal 0.5s ease both;
-                    color: var(--text-color);">
+                    border:1px solid rgba(120,120,120,0.18); animation: cardReveal 0.5s ease both;">
           <div style="font-size:20px; font-weight:800;">{profile['driver_name']}</div>
           <div style="opacity:0.75; font-size:13px; margin-top:4px;">
             {profile['status']} &nbsp;|&nbsp; {profile['vehicle_type']} &nbsp;|&nbsp;
