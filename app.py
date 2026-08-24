@@ -1315,6 +1315,25 @@ def clear_all_data() -> None:
     conn.close()
 
 
+def delete_month_data(month_year: str) -> dict:
+    """Wipes just ONE month's data -- monthly_logs rows and the
+    company-level salary_summary row for that month -- while leaving
+    the drivers table (roster/profiles) untouched. Use this before
+    re-uploading a corrected file for that month, so the re-upload
+    starts from a clean slate instead of merging on top of whatever
+    (possibly wrong) numbers were there before."""
+    conn = get_connection()
+    _ensure_salary_summary_table(conn)
+    logs_deleted = conn.execute(
+        "SELECT COUNT(*) FROM monthly_logs WHERE month_year = ?", (month_year,)
+    ).fetchone()[0]
+    conn.execute("DELETE FROM monthly_logs WHERE month_year = ?", (month_year,))
+    conn.execute("DELETE FROM salary_summary WHERE month_year = ?", (month_year,))
+    conn.commit()
+    conn.close()
+    return {"logs_deleted": logs_deleted}
+
+
 # ==============================================================================
 # DATA ACCESS HELPERS (return pandas DataFrames for the UI layer)
 # ==============================================================================
@@ -1421,6 +1440,39 @@ def render_sidebar():
             st.rerun()
 
         with st.sidebar.expander("\u26A0\uFE0F Danger Zone"):
+            month_options = distinct_months()
+            if month_options:
+                st.markdown("##### \U0001F5D3\uFE0F Delete One Month's Data")
+                st.caption(
+                    "Wipes only the selected month's orders/validity/payroll "
+                    "figures -- drivers/roster profiles are kept. Use this "
+                    "before re-uploading a corrected file for that month, so "
+                    "the new upload doesn't merge on top of old numbers."
+                )
+                month_to_delete = st.selectbox(
+                    "Month to delete", month_options, format_func=month_display,
+                    key="danger_zone_month_pick",
+                )
+                confirm_month_delete = st.checkbox(
+                    f"I understand this permanently deletes all "
+                    f"{month_display(month_to_delete)} data",
+                    key="danger_zone_month_confirm",
+                )
+                if st.button(
+                    f"\U0001F5D1\uFE0F Delete {month_display(month_to_delete)} Data",
+                    use_container_width=True,
+                    disabled=not confirm_month_delete,
+                ):
+                    result = delete_month_data(month_to_delete)
+                    st.success(
+                        f"Deleted {result['logs_deleted']} log row(s) for "
+                        f"{month_display(month_to_delete)}. You can now "
+                        f"re-upload a corrected file for that month."
+                    )
+                    st.rerun()
+                st.markdown("---")
+
+            st.markdown("##### \U0001F9E8 Clear Everything")
             st.caption("Permanently wipes all drivers and monthly logs.")
             if st.button("Clear All Data", use_container_width=True):
                 clear_all_data()
