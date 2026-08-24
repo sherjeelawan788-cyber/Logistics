@@ -37,6 +37,17 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+# gspread is optional -- only needed for the Google Sheets sync feature.
+# The whole app still works without it (Excel upload etc. are
+# unaffected); the Google Sheet sync panel just shows a clear "please
+# install" message instead of crashing the app on import.
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials as _GCredentials
+    GSPREAD_AVAILABLE = True
+except ImportError:  # noqa: BLE001
+    GSPREAD_AVAILABLE = False
+
 # ==============================================================================
 # CONFIG / CONSTANTS
 # ==============================================================================
@@ -1531,6 +1542,7 @@ def apply_filters(df: pd.DataFrame, filters: dict, month_scoped: bool = True) ->
 
 def render_dashboard(filters: dict):
     st.subheader("\U0001F4CA Operations & Workforce KPI Dashboard")
+    render_live_month_panel()
 
     merged = load_merged()
     if merged.empty:
@@ -2975,23 +2987,41 @@ def _score_roster_candidate(sheet_name: str, df: pd.DataFrame) -> float:
 
 
 def process_workbook_all_sheets(uploaded_file, month_year: str):
+    """Read every sheet of an uploaded Excel workbook and hand them off
+    to _process_sheet_frames(), which contains the actual classify/
+    extract/merge logic. Kept separate so the exact same logic can be
+    reused for a Google Sheet (see process_workbook_from_gsheet below)
+    without re-reading through pandas.ExcelFile at all."""
     xls = pd.ExcelFile(uploaded_file)
+    sheet_frames = []
+    sheet_read_errors = []
+    for sheet_name in xls.sheet_names:
+        try:
+            df, _hdr = _read_excel_smart(uploaded_file, sheet_name)
+            sheet_frames.append((sheet_name, df))
+        except Exception as exc:  # noqa: BLE001
+            sheet_read_errors.append((sheet_name, f"error reading sheet: {exc}"))
+    return _process_sheet_frames(sheet_frames, month_year, sheet_read_errors)
 
+
+def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors: list = None) -> dict:
+    """The actual whole-workbook auto-import engine: classify each
+    already-loaded sheet (roster / orders / validity / attendance /
+    cancellation / unrecognized), extract and merge everything into the
+    database for month_year. sheet_frames is a list of (sheet_name, df)
+    pairs -- it doesn't matter whether those DataFrames came from an
+    uploaded Excel file or a live Google Sheet, which is exactly what
+    lets both sources share this one code path."""
     roster_candidates = []  # [(sheet_name, df)] -- resolved to ONE roster after the loop
     orders_sheets = []
     validity_by_id = {}
     attendance_by_id = {}
     cancellations_by_name = {}
     id_to_name = {}
-    sheet_report = []
+    sheet_report = list(sheet_read_errors or [])
+    sheet_report = [(name, err, 0) for name, err in sheet_report]
 
-    for sheet_name in xls.sheet_names:
-        try:
-            df, _hdr = _read_excel_smart(uploaded_file, sheet_name)
-        except Exception as exc:  # noqa: BLE001
-            sheet_report.append((sheet_name, f"error reading sheet: {exc}", 0))
-            continue
-
+    for sheet_name, df in sheet_frames:
         df = df.dropna(axis=0, how="all").reset_index(drop=True)
         df.columns = [str(c).strip() for c in df.columns]
         if df.empty:
@@ -3179,6 +3209,414 @@ def process_workbook_all_sheets(uploaded_file, month_year: str):
     return summary
 
 
+# ==============================================================================
+# GOOGLE SHEETS SYNC  -- daily entries by supervisors, live + monthly import
+# ==============================================================================
+#
+# How this works, end to end:
+#
+#   1. Supervisors keep filling in a Google Sheet every day -- same
+#      shape as an uploaded Excel workbook (a roster tab, an ORDER
+#      REPORT tab with one column per date, an ATTENDANCE/VALIDITY tab
+#      the same way, etc.). Nothing about how they work day-to-day
+#      changes.
+#
+#   2. "Live This Month" (see render_live_month_panel) reads the sheet
+#      directly, live, and shows month-to-date totals WITHOUT writing
+#      anything to the database -- so the dashboard can always show
+#      "how's this month looking so far" even while the month is still
+#      in progress and numbers are still changing every day.
+#
+#   3. "Sync Now" (admin action, in this tab) pulls the whole sheet and
+#      runs it through the EXACT SAME import engine used for a manual
+#      Excel upload (_process_sheet_frames) -- same roster resolution,
+#      same duplicate-sheet detection, same placeholder-rider handling.
+#      This is what actually saves a month into permanent history.
+#      Can be run any time (once a week to checkpoint, or right at
+#      month-end) and re-running it for the same month just updates the
+#      numbers in place, so it's always safe to click again.
+#
+#   4. For FULLY unattended month-end saving (nobody has to open the
+#      dashboard and click a button), see the separate gsheet_sync.py
+#      script -- it reuses these exact same functions but runs from an
+#      OS-level scheduler (cron / Task Scheduler / cloud scheduler)
+#      instead of from a Streamlit button click.
+
+GSHEET_CONFIG_PATH = "hq_gsheet.json"
+
+
+def _load_gsheet_config():
+    if not os.path.exists(GSHEET_CONFIG_PATH):
+        return None
+    try:
+        with open(GSHEET_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _save_gsheet_config(sheet_id: str) -> None:
+    with open(GSHEET_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump({"sheet_id": sheet_id.strip()}, f)
+
+
+def _extract_sheet_id(url_or_id: str) -> str:
+    """Accept either a raw Sheet ID or a full Google Sheets URL and
+    return just the ID -- so the admin can paste whatever they have
+    copied without needing to know which part matters."""
+    s = url_or_id.strip()
+    match = re.search(r"/d/([a-zA-Z0-9-_]+)", s)
+    if match:
+        return match.group(1)
+    return s
+
+
+def _get_gspread_client():
+    """Authenticate using a Google Cloud service account. The service
+    account's credentials (a JSON key) must be stored in Streamlit's
+    secrets as [gcp_service_account] -- see the setup instructions in
+    render_gsheet_sync_tab(). Never hard-code credentials in this file."""
+    if not GSPREAD_AVAILABLE:
+        raise RuntimeError(
+            "The 'gspread' and 'google-auth' packages aren't installed. "
+            "Run: pip install gspread google-auth"
+        )
+    if "gcp_service_account" not in st.secrets:
+        raise RuntimeError(
+            "No Google service account configured. Add a [gcp_service_account] "
+            "section to your Streamlit secrets (see setup instructions below)."
+        )
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    creds = _GCredentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]), scopes=scopes
+    )
+    return gspread.authorize(creds)
+
+
+def _gsheet_worksheet_to_df(ws) -> pd.DataFrame:
+    """Pull one Google Sheet tab into a DataFrame the same way
+    _read_excel_smart() reads an Excel sheet: try row 1 as the header,
+    try row 2 as the header (some tabs -- like ORDER REPORT -- have a
+    title/section row first and the REAL column headers, e.g. actual
+    dates, one row down), and keep whichever version has fewer blank/
+    'Unnamed' columns."""
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
+
+    def _build(header_idx):
+        if header_idx >= len(values):
+            return None
+        header = [h.strip() if h.strip() else f"Unnamed: {i}" for i, h in enumerate(values[header_idx])]
+        body = values[header_idx + 1:]
+        if not body:
+            return pd.DataFrame(columns=header)
+        # Pad/trim each row to the header's width -- Google Sheets
+        # rows can come back shorter than the header if trailing
+        # cells are empty.
+        width = len(header)
+        fixed_body = [
+            (row + [""] * width)[:width] if len(row) < width else row[:width]
+            for row in body
+        ]
+        return pd.DataFrame(fixed_body, columns=header)
+
+    df0 = _build(0)
+    df1 = _build(1)
+
+    if df1 is not None and not df1.empty and _unnamed_ratio(df1.columns) < _unnamed_ratio(df0.columns if df0 is not None else []):
+        return df1
+    return df0 if df0 is not None else pd.DataFrame()
+
+
+def fetch_gsheet_frames(sheet_id: str) -> list:
+    """Open the Google Sheet by ID and return every tab as a
+    (sheet_name, DataFrame) pair -- the exact same shape
+    process_workbook_all_sheets() builds from an uploaded Excel file,
+    so both sources can share one importer (_process_sheet_frames)."""
+    client = _get_gspread_client()
+    sh = client.open_by_key(sheet_id)
+    frames = []
+    for ws in sh.worksheets():
+        try:
+            df = _gsheet_worksheet_to_df(ws)
+        except Exception as exc:  # noqa: BLE001
+            frames.append((ws.title, pd.DataFrame()))
+            continue
+        frames.append((ws.title, df))
+    return frames
+
+
+def sync_month_from_gsheet(sheet_id: str, month_year: str) -> dict:
+    """Pull the whole Google Sheet and import it into the database for
+    month_year, using the exact same engine as a manual Excel upload.
+    Safe to re-run any time -- existing drivers/months are updated in
+    place, never duplicated."""
+    frames = fetch_gsheet_frames(sheet_id)
+    return _process_sheet_frames(frames, month_year)
+
+
+def fetch_live_month_to_date(sheet_id: str) -> dict:
+    """A read-only peek at the Google Sheet's current numbers -- does
+    NOT write anything to the database. Used to show "this month so
+    far" on the live dashboard while the month is still in progress
+    and supervisors are still filling in today's column. Reuses the
+    same sheet-classification logic as the real importer, just skips
+    every database-writing step."""
+    frames = fetch_gsheet_frames(sheet_id)
+
+    roster_candidates = []
+    orders_sheets = []
+    validity_by_id = {}
+    attendance_by_id = {}
+    id_to_name = {}
+
+    for sheet_name, df in frames:
+        df = df.dropna(axis=0, how="all").reset_index(drop=True)
+        if df.empty:
+            continue
+        df.columns = [str(c).strip() for c in df.columns]
+        kind = _classify_sheet(df)
+        if kind == "roster":
+            roster_candidates.append((sheet_name, df))
+        elif kind == "orders":
+            orders_dict, names = _extract_orders(df)
+            orders_sheets.append(orders_dict)
+            id_to_name.update(names)
+        elif kind == "validity":
+            validity_dict, names = _extract_validity(df)
+            validity_by_id.update(validity_dict)
+            id_to_name.update(names)
+        elif kind == "attendance":
+            attendance_dict, names = _extract_attendance(df)
+            attendance_by_id.update(attendance_dict)
+            id_to_name.update(names)
+
+    roster_count = 0
+    if roster_candidates:
+        scored = sorted(
+            ((_score_roster_candidate(name, df), name, df) for name, df in roster_candidates),
+            key=lambda t: -t[0],
+        )
+        roster_records = _extract_roster(scored[0][2])
+        roster_count = len(roster_records)
+
+    orders_by_id = {}
+    for od in orders_sheets:
+        for k, v in od.items():
+            orders_by_id[k] = orders_by_id.get(k, 0) + v
+
+    valid_count = sum(1 for v in validity_by_id.values() if v["status"] == "Valid")
+    invalid_count = sum(1 for v in validity_by_id.values() if v["status"] == "Invalid")
+
+    return {
+        "roster_count": roster_count,
+        "riders_with_orders": len(orders_by_id),
+        "total_orders_so_far": sum(orders_by_id.values()),
+        "valid_count": valid_count,
+        "invalid_count": invalid_count,
+        "attendance_riders": len(attendance_by_id),
+        "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+def render_live_month_panel():
+    """Optional live 'This Month So Far' strip shown on the Operations
+    Dashboard, sourced directly from the connected Google Sheet -- not
+    from the database. Nothing here is saved; it's purely a live read
+    so the team can see today's numbers without waiting for month-end
+    or a manual sync."""
+    config = _load_gsheet_config()
+    if not config or not config.get("sheet_id"):
+        return
+    if not GSPREAD_AVAILABLE:
+        return
+
+    with st.expander("\U0001F4E1 Live This Month (from connected Google Sheet)", expanded=False):
+        if st.button("\U0001F504 Refresh live numbers", key="refresh_live_month"):
+            st.session_state.pop("live_month_cache", None)
+
+        if "live_month_cache" not in st.session_state:
+            try:
+                with st.spinner("Reading the Google Sheet..."):
+                    st.session_state["live_month_cache"] = fetch_live_month_to_date(config["sheet_id"])
+            except Exception as exc:  # noqa: BLE001
+                st.warning(f"Couldn't read the Google Sheet right now: {exc}")
+                return
+
+        live = st.session_state["live_month_cache"]
+        st.caption(f"As of {live['fetched_at']} -- not yet saved to history, just a live read.")
+        stat_cards([
+            {"icon": "\U0001F465", "label": "Riders on Sheet", "value": live["roster_count"],
+             "tip": "From the roster tab, right now", "variant": "a"},
+            {"icon": "\U0001F4E6", "label": "Orders So Far", "value": f"{live['total_orders_so_far']:,}",
+             "tip": "Sum of every day filled in so far this month", "variant": "b"},
+            {"icon": "\u2705", "label": "Valid (so far)", "value": live["valid_count"],
+             "tip": "Marked Valid in the validity tab", "variant": "a"},
+            {"icon": "\u274C", "label": "Invalid (so far)", "value": live["invalid_count"],
+             "tip": "Marked Invalid -- needs follow-up", "variant": "c"},
+        ])
+
+
+def render_gsheet_sync_tab():
+    st.subheader("\U0001F517 Google Sheet Sync")
+    st.write(
+        "Connect the same Google Sheet your supervisors update every day. Once "
+        "connected: the Operations Dashboard can show a **live, read-only "
+        "month-to-date view** straight from the sheet, and you can **Sync Now** "
+        "at any point (weekly, or at month-end) to save that month permanently "
+        "into this dashboard's history -- exactly like uploading an Excel file, "
+        "just pulled directly from Google instead."
+    )
+
+    if not GSPREAD_AVAILABLE:
+        st.error(
+            "The required packages aren't installed on this server. Ask whoever "
+            "manages the deployment to run:\n\n`pip install gspread google-auth`"
+        )
+        return
+
+    with st.expander("\u2699\uFE0F One-time setup (do this before connecting)", expanded="gcp_service_account" not in st.secrets):
+        st.markdown(
+            """
+1. **Create a Google Cloud service account** (free): in the
+   [Google Cloud Console](https://console.cloud.google.com/), create a
+   project (or use an existing one) → **APIs & Services → Credentials**
+   → **Create Credentials → Service Account**.
+2. Enable the **Google Sheets API** and **Google Drive API** for that
+   project (**APIs & Services → Library**, search each, click Enable).
+3. Open the service account you created → **Keys** tab → **Add Key →
+   Create new key → JSON**. This downloads a `.json` file -- keep it
+   private, never commit it anywhere public.
+4. In that JSON file, find the `"client_email"` value (looks like
+   `something@your-project.iam.gserviceaccount.com`). **Share your
+   Google Sheet with this email address** (Share button in Google
+   Sheets, give it Viewer access) -- exactly like sharing with a
+   colleague.
+5. Add the JSON file's contents to this app's **Streamlit secrets**
+   (`.streamlit/secrets.toml` if running locally, or the "Secrets"
+   panel if deployed on Streamlit Community Cloud) under a
+   `[gcp_service_account]` section, e.g.:
+
+```toml
+[gcp_service_account]
+type = "service_account"
+project_id = "your-project-id"
+private_key_id = "..."
+private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+client_email = "something@your-project.iam.gserviceaccount.com"
+client_id = "..."
+token_uri = "https://oauth2.googleapis.com/token"
+```
+
+   (Copy each field straight from the downloaded JSON -- just wrap the
+   whole thing under `[gcp_service_account]` as shown.)
+6. Restart the app after saving secrets.
+            """
+        )
+
+    config = _load_gsheet_config()
+    current_id = config["sheet_id"] if config else ""
+
+    sheet_input = st.text_input(
+        "Google Sheet URL or ID",
+        value=current_id,
+        placeholder="https://docs.google.com/spreadsheets/d/XXXXXXXX/edit",
+        help="Paste the full sheet link or just the ID -- either works.",
+    )
+    if st.button("\U0001F4BE Save Connection", use_container_width=True):
+        if not sheet_input.strip():
+            st.error("Please paste a Google Sheet URL or ID.")
+        else:
+            _save_gsheet_config(_extract_sheet_id(sheet_input))
+            st.success("Google Sheet connection saved.")
+            st.rerun()
+
+    if not config or not config.get("sheet_id"):
+        st.info("No Google Sheet connected yet -- paste a link above to get started.")
+        return
+
+    st.success(f"\u2705 Connected to Sheet ID: `{config['sheet_id']}`")
+
+    if st.button("\U0001F441\uFE0F Test Connection", use_container_width=True):
+        try:
+            with st.spinner("Connecting..."):
+                frames = fetch_gsheet_frames(config["sheet_id"])
+            st.success(f"Connected successfully -- found {len(frames)} tab(s): " + ", ".join(n for n, _ in frames))
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Couldn't connect: {exc}")
+
+    st.markdown("---")
+    st.markdown("#### \U0001F4E5 Sync a Month into History")
+    st.caption(
+        "Pulls the sheet right now and saves it as one month's record -- exactly "
+        "like the Excel auto-import. Safe to run again for the same month; it "
+        "updates numbers in place rather than duplicating them. Run this at "
+        "month-end (or any time you want to checkpoint the current numbers)."
+    )
+    inferred_month = datetime.today().strftime("%Y-%m")
+    sync_month = st.text_input("Month to sync (YYYY-MM)", value=inferred_month, key="gsheet_sync_month")
+
+    if st.button("\U0001F680 Sync Now", type="primary"):
+        if not sync_month.strip():
+            st.error("Please provide a month (YYYY-MM).")
+        else:
+            try:
+                with st.spinner("Reading the Google Sheet and importing..."):
+                    summary = sync_month_from_gsheet(config["sheet_id"], sync_month.strip())
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Sync failed: {exc}")
+            else:
+                st.success(
+                    f"Imported {summary['roster_count']} roster record(s) and wrote "
+                    f"{summary['logs_written']} monthly log row(s) for {sync_month.strip()}."
+                )
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Orders found for", f"{summary['orders_drivers']} riders")
+                m2.metric("Total Orders", f"{summary['orders_total']:,}")
+                m3.metric("Validity data for", f"{summary['validity_drivers']} riders")
+                m4.metric("Attendance data for", f"{summary['attendance_drivers']} riders")
+                if summary["placeholders_created"]:
+                    st.warning(
+                        f"\u26A0\uFE0F {summary['placeholders_created']} rider(s) appeared in "
+                        f"orders/validity/attendance but weren't in the roster tab -- "
+                        f"placeholder profiles were created. Find them in **Rider Lookup** "
+                        f"(search 'Unknown Rider')."
+                    )
+                st.markdown("##### What each tab was used for")
+                report_df = pd.DataFrame(summary["sheet_report"], columns=["Tab", "Detected as", "Rows"])
+                st.dataframe(report_df, use_container_width=True, hide_index=True)
+                st.session_state.pop("live_month_cache", None)
+                st.rerun()
+
+    st.markdown("---")
+    st.markdown("#### \U0001F916 Fully Automatic Month-End Saving")
+    st.caption(
+        "The button above needs someone to click it. If you'd rather this "
+        "happen completely on its own -- with nobody opening the dashboard -- "
+        "use the separate `gsheet_sync.py` script (provided alongside this app) "
+        "with an OS-level scheduler:"
+    )
+    st.code(
+        "# Runs the same sync used above, but from the command line --\n"
+        "# schedule this however your server supports:\n"
+        "#   Linux/macOS (cron), daily at 11:59 PM:\n"
+        "#     59 23 * * * cd /path/to/app && python3 gsheet_sync.py\n"
+        "#   Windows: use Task Scheduler to run the same command daily.\n"
+        "python3 gsheet_sync.py",
+        language="bash",
+    )
+    st.caption(
+        "Running it daily (not just on the last day) means even if a server "
+        "restart or a missed run happens right at month-end, you're never more "
+        "than a day out of date -- each run just re-syncs the current month in "
+        "place."
+    )
+
+
 def render_upload_tab():
     if not is_admin():
         st.info(
@@ -3187,11 +3625,15 @@ def render_upload_tab():
         )
         return
 
-    tab_ops, tab_salary = st.tabs(["\U0001F4E4 Roster / Orders / Validity", "\U0001F4B0 Salary Data"])
+    tab_ops, tab_salary, tab_gsheet = st.tabs(
+        ["\U0001F4E4 Roster / Orders / Validity", "\U0001F4B0 Salary Data", "\U0001F517 Google Sheet Sync"]
+    )
     with tab_ops:
         _render_operations_upload()
     with tab_salary:
         _render_salary_upload()
+    with tab_gsheet:
+        render_gsheet_sync_tab()
 
 
 def _render_operations_upload():
