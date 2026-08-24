@@ -728,15 +728,11 @@ def render_header(filters: dict):
             headcount = len(roster_f)
             active = int((roster_f["status"] == "Active").sum())
 
-    # Resolve the real, current theme text color in Python -- rendered
-    # server-side on every rerun, so it's always correct for whichever
-    # theme is active right now. This replaces the old approach of
-    # reading the parent page's computed color via JS from inside the
-    # iframe: that only ran once when the iframe was first mounted, so
-    # switching themes afterward left the OLD color baked in (e.g. white
-    # text captured under dark mode staying white -- and invisible --
-    # after switching to light mode, since Streamlit doesn't always
-    # remount an unchanged iframe on a theme change).
+    # A server-side default for the very first paint (Streamlit's
+    # light/dark TOGGLE is purely client-side -- the server has no idea
+    # which one the browser is actually showing unless it's hard-coded
+    # in config.toml, so this Python guess can be wrong and is only a
+    # starting point; the JS below is what actually keeps it correct).
     theme_base = st.get_option("theme.base") or "light"
     stat_text_color = st.get_option("theme.textColor") or (
         "#FAFAFA" if theme_base == "dark" else "#31333F"
@@ -790,11 +786,11 @@ def render_header(filters: dict):
       .stat-card .label {
         font-size: 13px; letter-spacing: 1.4px; text-transform: uppercase;
         opacity: 0.64; font-weight: 700;
-        color: __STAT_TEXT__;
+        color: var(--stat-text, __STAT_TEXT__);
       }
       .stat-card .value {
         font-size: 32px; font-weight: 900; margin-top: 4px;
-        color: __STAT_TEXT__;
+        color: var(--stat-text, __STAT_TEXT__);
       }
       .stat-card .htip {
         position: absolute; left: 50%; bottom: calc(100% + 10px); transform: translate(-50%, 6px);
@@ -947,11 +943,47 @@ def render_header(filters: dict):
         try {
           const doc = window.parent.document;
 
-          // Text color is now baked in server-side (see __STAT_TEXT__
-          // above) so it's correct on every render, including right
-          // after a theme switch. This script only handles the
-          // scroll-driven 3D tilt of the logo -- no more reading the
-          // parent page's computed color from here.
+          // Streamlit's light/dark toggle is 100% client-side -- it
+          // never triggers a Streamlit rerun, so this iframe's HTML
+          // (built server-side, see __STAT_TEXT__ above) never gets
+          // regenerated when the user flips the toggle. That's why a
+          // one-time color read used to go stale: it captured whatever
+          // theme was active at mount time and then never updated.
+          //
+          // Fix: keep --stat-text in sync with the REAL current theme
+          // for as long as this widget is on screen -- read it right
+          // away, then watch for theme changes (MutationObserver on
+          // the attributes Streamlit flips when toggling) and also
+          // poll on an interval as a cheap, reliable fallback in case
+          // the observer misses how a particular Streamlit version
+          // signals the switch.
+          function applyStatTextColor() {
+            try {
+              const parentColor = getComputedStyle(doc.body).color;
+              if (parentColor) {
+                document.documentElement.style.setProperty('--stat-text', parentColor);
+              }
+            } catch (e) {
+              // Leave the CSS fallback color in place if this fails.
+            }
+          }
+          applyStatTextColor();
+
+          try {
+            const observerTargets = [doc.documentElement, doc.body].filter(Boolean);
+            const observer = new MutationObserver(applyStatTextColor);
+            observerTargets.forEach((t) =>
+              observer.observe(t, { attributes: true, attributeFilter: ["class", "style", "data-theme"] })
+            );
+          } catch (e) {
+            // MutationObserver unavailable/blocked -- polling below still covers it.
+          }
+
+          // Belt-and-suspenders: re-check every second. Cheap (a single
+          // getComputedStyle call) and guarantees this never stays
+          // stuck on a stale color for long, regardless of how the
+          // theme switch is implemented under the hood.
+          setInterval(applyStatTextColor, 1000);
 
           const candidates = [
             doc.querySelector('section.main'),
