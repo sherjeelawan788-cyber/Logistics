@@ -2427,7 +2427,7 @@ def process_salary_workbook(uploaded_file, default_month: str) -> dict:
             continue
 
         df = df.dropna(axis=0, how="all").reset_index(drop=True)
-        df.columns = [str(c).strip() for c in df.columns]
+        df.columns = _dedupe_headers([str(c).strip() for c in df.columns])
         if df.empty:
             sheet_report.append((sheet_name, "empty", 0))
             continue
@@ -3023,7 +3023,7 @@ def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors
 
     for sheet_name, df in sheet_frames:
         df = df.dropna(axis=0, how="all").reset_index(drop=True)
-        df.columns = [str(c).strip() for c in df.columns]
+        df.columns = _dedupe_headers([str(c).strip() for c in df.columns])
         if df.empty:
             sheet_report.append((sheet_name, "empty", 0))
             continue
@@ -3296,6 +3296,28 @@ def _get_gspread_client():
     return gspread.authorize(creds)
 
 
+def _dedupe_headers(header: list) -> list:
+    """Mimic what pandas.read_excel() already does automatically for a
+    duplicated column name -- rename the 2nd, 3rd, etc. occurrence to
+    'Name.1', 'Name.2', and so on. Google Sheets happily lets a
+    supervisor's tab have two columns with the identical header text
+    (a typo'd re-entry, a copy-pasted section, etc.); without this, a
+    duplicate column label turns df[that_column] into a DataFrame
+    instead of a single column of values everywhere downstream expects
+    a plain Series -- which is what was crashing the sync with
+    "'DataFrame' object has no attribute 'str'"."""
+    seen = {}
+    deduped = []
+    for h in header:
+        if h not in seen:
+            seen[h] = 0
+            deduped.append(h)
+        else:
+            seen[h] += 1
+            deduped.append(f"{h}.{seen[h]}")
+    return deduped
+
+
 def _gsheet_worksheet_to_df(ws) -> pd.DataFrame:
     """Pull one Google Sheet tab into a DataFrame the same way
     _read_excel_smart() reads an Excel sheet: try row 1 as the header,
@@ -3311,6 +3333,7 @@ def _gsheet_worksheet_to_df(ws) -> pd.DataFrame:
         if header_idx >= len(values):
             return None
         header = [h.strip() if h.strip() else f"Unnamed: {i}" for i, h in enumerate(values[header_idx])]
+        header = _dedupe_headers(header)
         body = values[header_idx + 1:]
         if not body:
             return pd.DataFrame(columns=header)
@@ -3378,7 +3401,7 @@ def fetch_live_month_to_date(sheet_id: str) -> dict:
         df = df.dropna(axis=0, how="all").reset_index(drop=True)
         if df.empty:
             continue
-        df.columns = [str(c).strip() for c in df.columns]
+        df.columns = _dedupe_headers([str(c).strip() for c in df.columns])
         kind = _classify_sheet(df)
         if kind == "roster":
             roster_candidates.append((sheet_name, df))
