@@ -3256,8 +3256,17 @@ def _load_gsheet_config():
 
 
 def _save_gsheet_config(sheet_id: str) -> None:
+    _update_gsheet_config(sheet_id=sheet_id.strip())
+
+
+def _update_gsheet_config(**kwargs) -> dict:
+    """Merge new fields into hq_gsheet.json without wiping out fields
+    already set (sheet_id, auto_sync toggle, last-sync bookkeeping)."""
+    config = _load_gsheet_config() or {}
+    config.update(kwargs)
     with open(GSHEET_CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump({"sheet_id": sheet_id.strip()}, f)
+        json.dump(config, f)
+    return config
 
 
 def _extract_sheet_id(url_or_id: str) -> str:
@@ -3387,22 +3396,29 @@ def fetch_live_month_to_date(sheet_id: str) -> dict:
     NOT write anything to the database. Used to show "this month so
     far" on the live dashboard while the month is still in progress
     and supervisors are still filling in today's column. Reuses the
-    same sheet-classification logic as the real importer, just skips
-    every database-writing step."""
+    same sheet-classification and name/ID-matching logic as the real
+    importer (roster resolution, cancellation name-matching, etc.) so
+    the live view matches what a real Sync would produce -- it just
+    skips every database-writing step and additionally builds a
+    per-rider detail table for display."""
     frames = fetch_gsheet_frames(sheet_id)
 
     roster_candidates = []
     orders_sheets = []
     validity_by_id = {}
     attendance_by_id = {}
+    cancellations_by_name = {}
     id_to_name = {}
+    sheet_report = []  # (tab name, detected kind, row count) -- for the debugging expander
 
     for sheet_name, df in frames:
         df = df.dropna(axis=0, how="all").reset_index(drop=True)
         if df.empty:
+            sheet_report.append((sheet_name, "empty", 0))
             continue
         df.columns = _dedupe_headers([str(c).strip() for c in df.columns])
         kind = _classify_sheet(df)
+        sheet_report.append((sheet_name, kind, len(df)))
         if kind == "roster":
             roster_candidates.append((sheet_name, df))
         elif kind == "orders":
@@ -3417,41 +3433,147 @@ def fetch_live_month_to_date(sheet_id: str) -> dict:
             attendance_dict, names = _extract_attendance(df)
             attendance_by_id.update(attendance_dict)
             id_to_name.update(names)
+        elif kind == "cancellation":
+            for k, v in _extract_cancellations_by_name(df).items():
+                cancellations_by_name[k] = cancellations_by_name.get(k, 0) + v
 
-    roster_count = 0
+    roster_records = {}
+    roster_sheet_used = None
+    roster_sheets_seen = [name for name, _ in roster_candidates]
     if roster_candidates:
         scored = sorted(
             ((_score_roster_candidate(name, df), name, df) for name, df in roster_candidates),
             key=lambda t: -t[0],
         )
+        roster_sheet_used = scored[0][1]
         roster_records = _extract_roster(scored[0][2])
-        roster_count = len(roster_records)
 
     orders_by_id = {}
     for od in orders_sheets:
         for k, v in od.items():
             orders_by_id[k] = orders_by_id.get(k, 0) + v
 
+    # Match orders/validity/attendance/cancellation rows to a real
+    # roster driver_id by name when their own ID wasn't on the roster
+    # (typo, different numbering, etc.) -- same fuzzy-matching used by
+    # the real Sync, just against the live roster instead of the DB.
+    name_to_id = {r["driver_name"].strip().upper(): did for did, r in roster_records.items()}
+    known_ids = set(roster_records.keys())
+    orders_by_id = _remap_ids_by_name(orders_by_id, id_to_name, name_to_id, known_ids)
+    validity_by_id = _remap_ids_by_name(validity_by_id, id_to_name, name_to_id, known_ids)
+    attendance_by_id = _remap_ids_by_name(attendance_by_id, id_to_name, name_to_id, known_ids)
+
+    cancellations_by_id = {}
+    for name_key, count in cancellations_by_name.items():
+        did = _fuzzy_match_name_to_id(name_to_id, name_key)
+        if did:
+            cancellations_by_id[did] = cancellations_by_id.get(did, 0) + count
+
+    active_count = 0
+    terminated_count = 0
+    suspended_count = 0
+    company_cars = 0
+    own_cars = 0
+    for did, r in roster_records.items():
+        if r["status"] == "Terminated":
+            terminated_count += 1
+        elif r["status"] == "Suspended":
+            suspended_count += 1
+        else:
+            worked = orders_by_id.get(did, 0) > 0 or (
+                validity_by_id[did]["valid_days"] if did in validity_by_id else attendance_by_id.get(did, 0)
+            ) > 0
+            if worked:
+                active_count += 1
+        if r["vehicle_type"] == "Company Car":
+            company_cars += 1
+        elif r["vehicle_type"] == "Own Car":
+            own_cars += 1
+
     valid_count = sum(1 for v in validity_by_id.values() if v["status"] == "Valid")
     invalid_count = sum(1 for v in validity_by_id.values() if v["status"] == "Invalid")
 
+    all_ids = set(roster_records) | set(orders_by_id) | set(validity_by_id) | set(attendance_by_id) | set(cancellations_by_id)
+    rows = []
+    for did in all_ids:
+        r = roster_records.get(did, {})
+        val = validity_by_id.get(did)
+        rows.append({
+            "Driver ID": did,
+            "Name": r.get("driver_name") or id_to_name.get(did, f"Unknown ({did})"),
+            "Supervisor": r.get("supervisor_name") or "",
+            "Status": r.get("status") or "(not on roster)",
+            "Vehicle": r.get("vehicle_type") or "",
+            "Orders So Far": orders_by_id.get(did, 0),
+            "Cancelled So Far": cancellations_by_id.get(did, 0),
+            "Days Worked": val["valid_days"] if val else attendance_by_id.get(did, 0),
+            "Validity": val["status"] if val else "",
+        })
+    detail_df = pd.DataFrame(rows).sort_values("Name").reset_index(drop=True) if rows else pd.DataFrame()
+
     return {
-        "roster_count": roster_count,
+        "roster_count": len(roster_records),
+        "active_count": active_count,
+        "terminated_count": terminated_count,
+        "suspended_count": suspended_count,
+        "company_cars": company_cars,
+        "own_cars": own_cars,
         "riders_with_orders": len(orders_by_id),
         "total_orders_so_far": sum(orders_by_id.values()),
+        "total_cancelled_so_far": sum(cancellations_by_id.values()),
         "valid_count": valid_count,
         "invalid_count": invalid_count,
         "attendance_riders": len(attendance_by_id),
+        "detail_df": detail_df,
+        "sheet_report": sheet_report,
+        "roster_sheet_used": roster_sheet_used,
+        "roster_sheets_seen": roster_sheets_seen,
         "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
 
 
+def maybe_auto_sync_gsheet() -> None:
+    """If the Admin has turned on auto-sync, checkpoint the current
+    month once per day -- and, the first time this runs after the
+    calendar rolls into a new month, do one FINAL sync of the month
+    that just ended first, so nothing entered on its last day is
+    missed. This is what makes month-end saving happen without anyone
+    needing to click "Sync Now": it simply runs automatically the next
+    time the Admin opens the dashboard. Silently does nothing if it's
+    not configured, not the Admin, or the Sheet can't be reached right
+    now -- a Google API hiccup should never block the dashboard from
+    loading."""
+    if not is_admin() or not GSPREAD_AVAILABLE:
+        return
+    config = _load_gsheet_config()
+    if not config or not config.get("sheet_id") or not config.get("auto_sync"):
+        return
+
+    today_str = datetime.today().strftime("%Y-%m-%d")
+    if config.get("last_auto_sync_date") == today_str:
+        return  # already checked today -- avoid hitting the Sheet on every rerun
+
+    current_month = datetime.today().strftime("%Y-%m")
+    last_synced_month = config.get("last_synced_month")
+
+    try:
+        if last_synced_month and last_synced_month != current_month:
+            sync_month_from_gsheet(config["sheet_id"], last_synced_month)
+        sync_month_from_gsheet(config["sheet_id"], current_month)
+        _update_gsheet_config(last_auto_sync_date=today_str, last_synced_month=current_month)
+        st.toast(f"\U0001F4E1 Auto-synced {month_display(current_month)} from Google Sheet", icon="\u2705")
+    except Exception:  # noqa: BLE001
+        pass  # will simply retry next time the Admin opens the app
+
+
 def render_live_month_panel():
-    """Optional live 'This Month So Far' strip shown on the Operations
-    Dashboard, sourced directly from the connected Google Sheet -- not
-    from the database. Nothing here is saved; it's purely a live read
-    so the team can see today's numbers without waiting for month-end
-    or a manual sync."""
+    """The full 'This Month So Far' picture, sourced directly from the
+    connected Google Sheet -- not from the database. Nothing here is
+    saved; it's purely a live read so the team can see today's numbers
+    without waiting for month-end or a manual sync. Mirrors everything
+    the real Sync would capture: headcount by status, vehicle types,
+    orders, cancellations, validity, attendance, and a full per-rider
+    table."""
     config = _load_gsheet_config()
     if not config or not config.get("sheet_id"):
         return
@@ -3459,29 +3581,105 @@ def render_live_month_panel():
         return
 
     with st.expander("\U0001F4E1 Live This Month (from connected Google Sheet)", expanded=False):
-        if st.button("\U0001F504 Refresh live numbers", key="refresh_live_month"):
-            st.session_state.pop("live_month_cache", None)
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            if st.button("\U0001F504 Refresh live numbers", key="refresh_live_month", use_container_width=True):
+                st.session_state.pop("live_month_cache", None)
+        with btn_col2:
+            save_now = st.button(
+                "\U0001F4BE Save This Month to History Now", key="live_panel_save_now",
+                type="primary", use_container_width=True,
+                help="Saves exactly what's shown below into permanent history for this month -- same as Sync Now.",
+            )
 
         if "live_month_cache" not in st.session_state:
             try:
-                with st.spinner("Reading the Google Sheet..."):
+                with st.spinner("Reading every tab of the Google Sheet..."):
                     st.session_state["live_month_cache"] = fetch_live_month_to_date(config["sheet_id"])
             except Exception as exc:  # noqa: BLE001
                 st.warning(f"Couldn't read the Google Sheet right now: {exc}")
                 return
 
+        if save_now:
+            current_month = datetime.today().strftime("%Y-%m")
+            try:
+                with st.spinner(f"Saving {month_display(current_month)} into history..."):
+                    summary = sync_month_from_gsheet(config["sheet_id"], current_month)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Save failed: {exc}")
+            else:
+                st.success(
+                    f"Saved {month_display(current_month)} -- {summary['roster_count']} roster "
+                    f"record(s), {summary['logs_written']} monthly log row(s) written."
+                )
+                _update_gsheet_config(
+                    last_auto_sync_date=datetime.today().strftime("%Y-%m-%d"),
+                    last_synced_month=current_month,
+                )
+                st.session_state.pop("live_month_cache", None)
+                st.rerun()
+
         live = st.session_state["live_month_cache"]
-        st.caption(f"As of {live['fetched_at']} -- not yet saved to history, just a live read.")
+        st.caption(f"As of {live['fetched_at']} -- not yet saved to history until you click Save.")
+
         stat_cards([
             {"icon": "\U0001F465", "label": "Riders on Sheet", "value": live["roster_count"],
              "tip": "From the roster tab, right now", "variant": "a"},
-            {"icon": "\U0001F4E6", "label": "Orders So Far", "value": f"{live['total_orders_so_far']:,}",
-             "tip": "Sum of every day filled in so far this month", "variant": "b"},
+            {"icon": "\U0001F7E2", "label": "Active", "value": live["active_count"],
+             "tip": "Not terminated/suspended, shows activity so far", "variant": "a"},
+            {"icon": "\U0001F6D1", "label": "Terminated", "value": live["terminated_count"],
+             "tip": "Marked Terminated on the roster tab", "variant": "c"},
+            {"icon": "\u23F8\uFE0F", "label": "Suspended", "value": live["suspended_count"],
+             "tip": "Temporarily suspended / on leave", "variant": "d"},
+        ])
+        stat_cards([
+            {"icon": "\U0001F697", "label": "Company Cars", "value": live["company_cars"],
+             "tip": "Riders using a company-provided vehicle", "variant": "b"},
+            {"icon": "\U0001F699", "label": "Own Cars", "value": live["own_cars"],
+             "tip": "Riders using their own vehicle", "variant": "b"},
             {"icon": "\u2705", "label": "Valid (so far)", "value": live["valid_count"],
              "tip": "Marked Valid in the validity tab", "variant": "a"},
             {"icon": "\u274C", "label": "Invalid (so far)", "value": live["invalid_count"],
              "tip": "Marked Invalid -- needs follow-up", "variant": "c"},
         ])
+        stat_cards([
+            {"icon": "\U0001F4E6", "label": "Orders So Far", "value": f"{live['total_orders_so_far']:,}",
+             "tip": "Sum of every day filled in so far this month", "variant": "a"},
+            {"icon": "\U0001F6AB", "label": "Cancelled So Far", "value": f"{live['total_cancelled_so_far']:,}",
+             "tip": "From the cancellation tab, matched by name", "variant": "c"},
+            {"icon": "\U0001F4C5", "label": "Attendance Riders", "value": live["attendance_riders"],
+             "tip": "Riders with attendance data so far", "variant": "b"},
+            {"icon": "\U0001F4CB", "label": "Riders w/ Orders", "value": live["riders_with_orders"],
+             "tip": "Distinct riders with at least one order logged", "variant": "d"},
+        ])
+
+        st.markdown("---")
+        st.markdown("##### Every rider, live from the Sheet")
+        if live["detail_df"].empty:
+            st.caption("No rider-level data found yet.")
+        else:
+            st.dataframe(live["detail_df"], use_container_width=True, hide_index=True)
+
+        with st.expander("\U0001F50D Tab-by-tab breakdown (use this if a number looks wrong)"):
+            st.caption(
+                "Shows exactly how each tab in your Sheet was read and classified. "
+                "If 'Riders on Sheet' doesn't match your actual roster count, check "
+                "which tab is listed as **Roster sheet used** below -- if it's the "
+                "wrong tab (or the row count for it looks too low), that's the tab "
+                "to fix (e.g. rename it more clearly, remove a stray near-duplicate "
+                "tab, or check that its ID/Name columns have proper headers)."
+            )
+            if live.get("roster_sheet_used"):
+                st.markdown(f"**Roster sheet used:** `{live['roster_sheet_used']}`")
+            if len(live.get("roster_sheets_seen", [])) > 1:
+                st.warning(
+                    "\u26A0\uFE0F More than one tab looked like a roster: "
+                    + ", ".join(f"`{n}`" for n in live["roster_sheets_seen"])
+                    + " -- only the best match above was used. If the wrong one was "
+                    "picked, that's very likely why the count is off."
+                )
+            report_df = pd.DataFrame(live["sheet_report"], columns=["Tab", "Detected as", "Rows"])
+            st.dataframe(report_df, use_container_width=True, hide_index=True)
 
 
 def render_gsheet_sync_tab():
@@ -3616,12 +3814,36 @@ token_uri = "https://oauth2.googleapis.com/token"
                 st.rerun()
 
     st.markdown("---")
-    st.markdown("#### \U0001F916 Fully Automatic Month-End Saving")
+    st.markdown("#### \U0001F916 Automatic Month-End Saving")
     st.caption(
-        "The button above needs someone to click it. If you'd rather this "
-        "happen completely on its own -- with nobody opening the dashboard -- "
-        "use the separate `gsheet_sync.py` script (provided alongside this app) "
-        "with an OS-level scheduler:"
+        "Turn this on and the dashboard checkpoints the current month "
+        "automatically the next time you (Admin) open it -- once a day is "
+        "enough. The moment the calendar rolls into a new month, it also "
+        "does one FINAL sync of the month that just ended first, so nothing "
+        "entered on the last day gets missed. No button-clicking needed."
+    )
+    auto_sync_on = st.checkbox(
+        "\U0001F501 Auto-save automatically when I open the dashboard",
+        value=bool(config.get("auto_sync", False)),
+        key="gsheet_auto_sync_toggle",
+    )
+    if auto_sync_on != bool(config.get("auto_sync", False)):
+        _update_gsheet_config(auto_sync=auto_sync_on)
+        st.rerun()
+
+    if config.get("last_auto_sync_date"):
+        st.caption(
+            f"Last auto-sync: **{config['last_auto_sync_date']}** "
+            f"(month checkpointed: {month_display(config.get('last_synced_month', ''))})."
+        )
+
+    st.markdown("---")
+    st.markdown("#### \U0001F5A5\uFE0F Fully Unattended (even if nobody ever opens the dashboard)")
+    st.caption(
+        "The toggle above still needs an Admin to open the dashboard at least "
+        "once a day. If you want saving to happen even if NOBODY ever opens "
+        "it, use the separate `gsheet_sync.py` script (provided alongside "
+        "this app) with an OS-level scheduler instead:"
     )
     st.code(
         "# Runs the same sync used above, but from the command line --\n"
@@ -4295,6 +4517,7 @@ def main():
         return
 
     render_hq_banner()
+    maybe_auto_sync_gsheet()
 
     filters = render_sidebar()
     render_header(filters)
