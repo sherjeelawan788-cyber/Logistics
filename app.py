@@ -3004,14 +3004,20 @@ def process_workbook_all_sheets(uploaded_file, month_year: str):
     return _process_sheet_frames(sheet_frames, month_year, sheet_read_errors)
 
 
-def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors: list = None) -> dict:
+def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors: list = None, roster_tab_override: str = None) -> dict:
     """The actual whole-workbook auto-import engine: classify each
     already-loaded sheet (roster / orders / validity / attendance /
     cancellation / unrecognized), extract and merge everything into the
     database for month_year. sheet_frames is a list of (sheet_name, df)
     pairs -- it doesn't matter whether those DataFrames came from an
     uploaded Excel file or a live Google Sheet, which is exactly what
-    lets both sources share this one code path."""
+    lets both sources share this one code path.
+
+    roster_tab_override: when a workbook has more than one roster-
+    shaped tab, auto-scoring (see _score_roster_candidate) can pick the
+    wrong one. If given, this tab name (matched case-insensitively,
+    whitespace-trimmed) is used as the roster directly, bypassing
+    scoring entirely -- the admin's explicit choice always wins."""
     roster_candidates = []  # [(sheet_name, df)] -- resolved to ONE roster after the loop
     orders_sheets = []
     validity_by_id = {}
@@ -3020,10 +3026,16 @@ def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors
     id_to_name = {}
     sheet_report = list(sheet_read_errors or [])
     sheet_report = [(name, err, 0) for name, err in sheet_report]
+    override_df = None
+    override_matched_name = None
+    override_key = roster_tab_override.strip().lower() if roster_tab_override else None
 
     for sheet_name, df in sheet_frames:
         df = df.dropna(axis=0, how="all").reset_index(drop=True)
         df.columns = _dedupe_headers([str(c).strip() for c in df.columns])
+        if override_key and sheet_name.strip().lower() == override_key:
+            override_df = df
+            override_matched_name = sheet_name
         if df.empty:
             sheet_report.append((sheet_name, "empty", 0))
             continue
@@ -3059,11 +3071,21 @@ def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors
     # any OTHER roster-shaped sheet only contributes riders whose ID
     # isn't already in the primary sheet, so a genuinely unique rider
     # sitting only in a secondary sheet still isn't lost.
+    #
+    # If the admin explicitly named a tab (roster_tab_override), that
+    # tab wins outright -- no scoring, no merging from other roster-
+    # shaped tabs. Trust the human over the heuristic.
     roster_records = {}
     roster_sheet_used = None
     roster_sheets_skipped = []
     extra_riders_from_skipped = 0
-    if roster_candidates:
+    roster_override_requested_but_not_found = bool(roster_tab_override) and override_df is None
+
+    if override_df is not None:
+        roster_sheet_used = override_matched_name
+        roster_records = _extract_roster(override_df, month_year)
+        roster_sheets_skipped = [name for name, _ in roster_candidates if name != override_matched_name]
+    elif roster_candidates:
         scored = sorted(
             ((_score_roster_candidate(name, df), name, df) for name, df in roster_candidates),
             key=lambda t: -t[0],
@@ -3205,6 +3227,7 @@ def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors
         "roster_sheet_used": roster_sheet_used,
         "roster_sheets_skipped": roster_sheets_skipped,
         "extra_riders_from_skipped": extra_riders_from_skipped,
+        "roster_override_requested_but_not_found": roster_override_requested_but_not_found,
     }
     return summary
 
@@ -3382,16 +3405,18 @@ def fetch_gsheet_frames(sheet_id: str) -> list:
     return frames
 
 
-def sync_month_from_gsheet(sheet_id: str, month_year: str) -> dict:
+def sync_month_from_gsheet(sheet_id: str, month_year: str, roster_tab_override: str = None) -> dict:
     """Pull the whole Google Sheet and import it into the database for
     month_year, using the exact same engine as a manual Excel upload.
     Safe to re-run any time -- existing drivers/months are updated in
-    place, never duplicated."""
+    place, never duplicated. roster_tab_override: see
+    _process_sheet_frames -- forces a specific tab name to be used as
+    the roster instead of auto-scoring."""
     frames = fetch_gsheet_frames(sheet_id)
-    return _process_sheet_frames(frames, month_year)
+    return _process_sheet_frames(frames, month_year, roster_tab_override=roster_tab_override)
 
 
-def fetch_live_month_to_date(sheet_id: str) -> dict:
+def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> dict:
     """A read-only peek at the Google Sheet's current numbers -- does
     NOT write anything to the database. Used to show "this month so
     far" on the live dashboard while the month is still in progress
@@ -3400,7 +3425,9 @@ def fetch_live_month_to_date(sheet_id: str) -> dict:
     importer (roster resolution, cancellation name-matching, etc.) so
     the live view matches what a real Sync would produce -- it just
     skips every database-writing step and additionally builds a
-    per-rider detail table for display."""
+    per-rider detail table for display. roster_tab_override: see
+    _process_sheet_frames -- forces a specific tab name to be used as
+    the roster instead of auto-scoring."""
     frames = fetch_gsheet_frames(sheet_id)
 
     roster_candidates = []
@@ -3410,6 +3437,9 @@ def fetch_live_month_to_date(sheet_id: str) -> dict:
     cancellations_by_name = {}
     id_to_name = {}
     sheet_report = []  # (tab name, detected kind, row count) -- for the debugging expander
+    override_df = None
+    override_matched_name = None
+    override_key = roster_tab_override.strip().lower() if roster_tab_override else None
 
     for sheet_name, df in frames:
         df = df.dropna(axis=0, how="all").reset_index(drop=True)
@@ -3417,6 +3447,9 @@ def fetch_live_month_to_date(sheet_id: str) -> dict:
             sheet_report.append((sheet_name, "empty", 0))
             continue
         df.columns = _dedupe_headers([str(c).strip() for c in df.columns])
+        if override_key and sheet_name.strip().lower() == override_key:
+            override_df = df
+            override_matched_name = sheet_name
         kind = _classify_sheet(df)
         sheet_report.append((sheet_name, kind, len(df)))
         if kind == "roster":
@@ -3440,7 +3473,12 @@ def fetch_live_month_to_date(sheet_id: str) -> dict:
     roster_records = {}
     roster_sheet_used = None
     roster_sheets_seen = [name for name, _ in roster_candidates]
-    if roster_candidates:
+    roster_override_requested_but_not_found = bool(roster_tab_override) and override_df is None
+
+    if override_df is not None:
+        roster_sheet_used = override_matched_name
+        roster_records = _extract_roster(override_df)
+    elif roster_candidates:
         scored = sorted(
             ((_score_roster_candidate(name, df), name, df) for name, df in roster_candidates),
             key=lambda t: -t[0],
@@ -3528,6 +3566,7 @@ def fetch_live_month_to_date(sheet_id: str) -> dict:
         "sheet_report": sheet_report,
         "roster_sheet_used": roster_sheet_used,
         "roster_sheets_seen": roster_sheets_seen,
+        "roster_override_requested_but_not_found": roster_override_requested_but_not_found,
         "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
 
@@ -3558,8 +3597,8 @@ def maybe_auto_sync_gsheet() -> None:
 
     try:
         if last_synced_month and last_synced_month != current_month:
-            sync_month_from_gsheet(config["sheet_id"], last_synced_month)
-        sync_month_from_gsheet(config["sheet_id"], current_month)
+            sync_month_from_gsheet(config["sheet_id"], last_synced_month, roster_tab_override=config.get("roster_tab_override"))
+        sync_month_from_gsheet(config["sheet_id"], current_month, roster_tab_override=config.get("roster_tab_override"))
         _update_gsheet_config(last_auto_sync_date=today_str, last_synced_month=current_month)
         st.toast(f"\U0001F4E1 Auto-synced {month_display(current_month)} from Google Sheet", icon="\u2705")
     except Exception:  # noqa: BLE001
@@ -3595,7 +3634,7 @@ def render_live_month_panel():
         if "live_month_cache" not in st.session_state:
             try:
                 with st.spinner("Reading every tab of the Google Sheet..."):
-                    st.session_state["live_month_cache"] = fetch_live_month_to_date(config["sheet_id"])
+                    st.session_state["live_month_cache"] = fetch_live_month_to_date(config["sheet_id"], roster_tab_override=config.get("roster_tab_override"))
             except Exception as exc:  # noqa: BLE001
                 st.warning(f"Couldn't read the Google Sheet right now: {exc}")
                 return
@@ -3604,7 +3643,7 @@ def render_live_month_panel():
             current_month = datetime.today().strftime("%Y-%m")
             try:
                 with st.spinner(f"Saving {month_display(current_month)} into history..."):
-                    summary = sync_month_from_gsheet(config["sheet_id"], current_month)
+                    summary = sync_month_from_gsheet(config["sheet_id"], current_month, roster_tab_override=config.get("roster_tab_override"))
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Save failed: {exc}")
             else:
@@ -3771,6 +3810,27 @@ token_uri = "https://oauth2.googleapis.com/token"
             st.error(f"Couldn't connect: {exc}")
 
     st.markdown("---")
+    st.markdown("#### \U0001F3AF Roster Tab Override")
+    st.caption(
+        "If your Sheet has more than one tab that looks like a roster (e.g. "
+        "'Main Data' and 'Registered ID'), auto-detection picks whichever "
+        "looks most complete -- which can be the wrong one. Type the EXACT "
+        "tab name here to force that tab to always be used as the roster. "
+        "Leave blank to auto-detect."
+    )
+    roster_override_input = st.text_input(
+        "Roster tab name (exact, case doesn't matter)",
+        value=config.get("roster_tab_override") or "",
+        placeholder="e.g. Main Data",
+        key="roster_tab_override_input",
+    )
+    if st.button("\U0001F4BE Save Roster Tab Choice", use_container_width=True):
+        _update_gsheet_config(roster_tab_override=roster_override_input.strip() or None)
+        st.session_state.pop("live_month_cache", None)
+        st.success("Saved.")
+        st.rerun()
+
+    st.markdown("---")
     st.markdown("#### \U0001F4E5 Sync a Month into History")
     st.caption(
         "Pulls the sheet right now and saves it as one month's record -- exactly "
@@ -3787,7 +3847,7 @@ token_uri = "https://oauth2.googleapis.com/token"
         else:
             try:
                 with st.spinner("Reading the Google Sheet and importing..."):
-                    summary = sync_month_from_gsheet(config["sheet_id"], sync_month.strip())
+                    summary = sync_month_from_gsheet(config["sheet_id"], sync_month.strip(), roster_tab_override=config.get("roster_tab_override"))
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Sync failed: {exc}")
             else:
