@@ -3209,6 +3209,26 @@ def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors
         )
         logs_written += 1
 
+    if roster_records:
+        # This sync DID find a definitive roster (a real roster tab was
+        # read, not just a payroll-only upload with no roster of its
+        # own) -- so this is the one safe place to CLEAR a stale
+        # in_roster flag: any driver_id still marked in_roster=1 for
+        # this month but NOT in this sync's roster_records is left over
+        # from an earlier, less accurate sync (e.g. before a Roster Tab
+        # Override was set to fix the wrong sheet being auto-picked).
+        # Without this cleanup, that stale flag sticks forever, because
+        # the merge above only ever ADDS in_roster=1 and never removes
+        # it -- by design, so a payroll-only upload never wipes out a
+        # rider's roster membership. A sync that legitimately resolved
+        # a roster is the one case allowed to correct it.
+        placeholders = ",".join("?" for _ in roster_records)
+        conn.execute(
+            f"UPDATE monthly_logs SET in_roster = 0 "
+            f"WHERE month_year = ? AND in_roster = 1 AND driver_id NOT IN ({placeholders})",
+            (month_year, *roster_records.keys()),
+        )
+
     conn.commit()
     conn.close()
 
