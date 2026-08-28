@@ -2736,6 +2736,7 @@ def _extract_roster(df: pd.DataFrame, month_year: str = None) -> dict:
     status_col = _guess_column(cols, FIELD_ALIASES["status"])
     join_col = _guess_column(cols, FIELD_ALIASES["join_date"])
     end_col = _guess_column(cols, FIELD_ALIASES["termination_date"])
+    orders_col = _guess_column(cols, FIELD_ALIASES["total_orders"])
 
     exclude = {id_col, name_col, first_col, last_col, phone_col, sup_col,
                sponsor_col, iqama_col, join_col, end_col}
@@ -2817,6 +2818,18 @@ def _extract_roster(df: pd.DataFrame, month_year: str = None) -> dict:
             "status": status,
             "join_date": _clean_date_value(raw[join_col]) if join_col != NONE_OPTION else None,
             "termination_date": termination_date,
+            # If the roster tab ITSELF carries a per-rider order total
+            # (some sheets do -- a 'Total Orders' column right there
+            # alongside the roster), that figure is captured here so it
+            # can take priority over whatever a separate day-by-day
+            # orders tab computes for the same rider. Not written to
+            # the drivers table (upsert_driver ignores unknown keys) --
+            # only used by the orders-merging step below.
+            "roster_total_orders": (
+                _clean_number_value(raw[orders_col], as_int=True)
+                if orders_col != NONE_OPTION and not pd.isna(raw[orders_col])
+                else None
+            ),
         }
     return records
 
@@ -3151,6 +3164,17 @@ def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors
     orders_by_id = _remap_ids_by_name(orders_by_id, id_to_name, name_to_id, known_driver_ids)
     validity_by_id = _remap_ids_by_name(validity_by_id, id_to_name, name_to_id, known_driver_ids)
     attendance_by_id = _remap_ids_by_name(attendance_by_id, id_to_name, name_to_id, known_driver_ids)
+
+    # If the roster tab itself carries a per-rider order total (see
+    # _extract_roster), that figure wins over whatever a separate
+    # day-by-day orders tab computed for the same rider -- the roster
+    # sheet is the one the admin has confirmed is authoritative (via
+    # Roster Tab Override), so its own numbers should be trusted over a
+    # different tab that may be stale, duplicated, or miscounted.
+    for did, rec in roster_records.items():
+        roster_total = rec.get("roster_total_orders")
+        if roster_total is not None:
+            orders_by_id[did] = roster_total
 
     cancellations_by_id = {}
     unmatched_names = 0
@@ -3536,6 +3560,14 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
     orders_by_id = _remap_ids_by_name(orders_by_id, id_to_name, name_to_id, known_ids)
     validity_by_id = _remap_ids_by_name(validity_by_id, id_to_name, name_to_id, known_ids)
     attendance_by_id = _remap_ids_by_name(attendance_by_id, id_to_name, name_to_id, known_ids)
+
+    # Same rule as the real Sync: if the roster tab itself carries a
+    # per-rider order total, that wins over a separate day-by-day
+    # orders tab for the same rider.
+    for did, rec in roster_records.items():
+        roster_total = rec.get("roster_total_orders")
+        if roster_total is not None:
+            orders_by_id[did] = roster_total
 
     cancellations_by_id = {}
     for name_key, count in cancellations_by_name.items():
