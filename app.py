@@ -3532,11 +3532,13 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
 
     roster_records = {}
     roster_sheet_used = None
+    roster_sheet_columns = []
     roster_sheets_seen = [name for name, _ in roster_candidates]
     roster_override_requested_but_not_found = bool(roster_tab_override) and override_df is None
 
     if override_df is not None:
         roster_sheet_used = override_matched_name
+        roster_sheet_columns = list(override_df.columns)
         roster_records = _extract_roster(override_df)
     elif roster_candidates:
         scored = sorted(
@@ -3544,6 +3546,7 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
             key=lambda t: -t[0],
         )
         roster_sheet_used = scored[0][1]
+        roster_sheet_columns = list(scored[0][2].columns)
         roster_records = _extract_roster(scored[0][2])
 
     orders_by_id = {}
@@ -3640,6 +3643,7 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
         "roster_override_requested_but_not_found": roster_override_requested_but_not_found,
         "roster_orders_riders": roster_orders_riders,
         "roster_orders_sum": roster_orders_sum,
+        "roster_sheet_columns": roster_sheet_columns,
         "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
 
@@ -3805,6 +3809,9 @@ def render_live_month_panel():
                     "column, check its exact header text -- it needs to contain words like "
                     "'orders', 'total orders', or 'trips'/'deliveries' for it to be detected."
                 )
+                if live.get("roster_sheet_columns"):
+                    st.caption("Column headers Streamlit actually read from the roster sheet:")
+                    st.code(" | ".join(str(c) for c in live["roster_sheet_columns"]), language=None)
             report_df = pd.DataFrame(live["sheet_report"], columns=["Tab", "Detected as", "Rows"])
             st.dataframe(report_df, use_container_width=True, hide_index=True)
 
