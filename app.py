@@ -1973,6 +1973,22 @@ def _clean_date_value(v):
     return s
 
 
+_YYYY_MM_DD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _is_real_parsed_date(s) -> bool:
+    """True only if s is a date _clean_date_value() actually managed to
+    PARSE (always comes back as YYYY-MM-DD when it succeeds) -- not
+    just any non-blank text sitting in an Ending/Termination Date
+    column. Some supervisors reuse that column for free-text notes
+    ('next month vacation', 'move to another city in Sep', a bare
+    'terminate' with no date) instead of a real date. Treating ANY
+    non-blank value there as proof of termination was marking people
+    Terminated off a casual note about a FUTURE plan, not an actual
+    end date -- this is the check that keeps that from happening."""
+    return bool(s) and bool(_YYYY_MM_DD_RE.match(s))
+
+
 def _clean_month_value(v) -> str:
     if pd.isna(v):
         return ""
@@ -2776,14 +2792,14 @@ def _extract_roster(df: pd.DataFrame, month_year: str = None) -> dict:
         status_val = str(raw[status_col]).strip() if status_col != NONE_OPTION and not pd.isna(raw[status_col]) else ""
         if status_val in DRIVER_STATUSES:
             status = status_val
-        elif termination_date:
+        elif _is_real_parsed_date(termination_date):
             status = "Terminated"
         elif current_section_status:
             status = current_section_status
         else:
             status = "Active"
 
-        if status == "Terminated" and not termination_date and month_year:
+        if status == "Terminated" and not _is_real_parsed_date(termination_date) and month_year:
             # The section said "Terminated" but this row's own Ending Date
             # cell was blank -- fall back to the 1st of the upload month so
             # this rider still counts in that month's "Terminated" tile
