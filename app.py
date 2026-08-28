@@ -3617,6 +3617,9 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
         })
     detail_df = pd.DataFrame(rows).sort_values("Name").reset_index(drop=True) if rows else pd.DataFrame()
 
+    roster_orders_riders = sum(1 for rec in roster_records.values() if rec.get("roster_total_orders") is not None)
+    roster_orders_sum = sum(rec.get("roster_total_orders") or 0 for rec in roster_records.values())
+
     return {
         "roster_count": len(roster_records),
         "active_count": active_count,
@@ -3635,6 +3638,8 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
         "roster_sheet_used": roster_sheet_used,
         "roster_sheets_seen": roster_sheets_seen,
         "roster_override_requested_but_not_found": roster_override_requested_but_not_found,
+        "roster_orders_riders": roster_orders_riders,
+        "roster_orders_sum": roster_orders_sum,
         "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
 
@@ -3784,6 +3789,21 @@ def render_live_month_panel():
                     + ", ".join(f"`{n}`" for n in live["roster_sheets_seen"])
                     + " -- only the best match above was used. If the wrong one was "
                     "picked, that's very likely why the count is off."
+                )
+            if live.get("roster_orders_riders", 0) > 0:
+                st.success(
+                    f"\u2705 The roster sheet's own **Total Orders** column WAS found and "
+                    f"used -- {live['roster_orders_riders']} rider(s), summing to "
+                    f"**{live['roster_orders_sum']:,}**. This is what 'Orders So Far' above "
+                    f"is based on."
+                )
+            else:
+                st.info(
+                    "\u2139\uFE0F No **Total Orders**-style column was found on the roster "
+                    "sheet itself, so 'Orders So Far' above comes entirely from a separate "
+                    "orders/day-by-day tab instead. If your roster sheet DOES have such a "
+                    "column, check its exact header text -- it needs to contain words like "
+                    "'orders', 'total orders', or 'trips'/'deliveries' for it to be detected."
                 )
             report_df = pd.DataFrame(live["sheet_report"], columns=["Tab", "Detected as", "Rows"])
             st.dataframe(report_df, use_container_width=True, hide_index=True)
