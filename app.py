@@ -2866,6 +2866,52 @@ def _extract_orders(df: pd.DataFrame):
     return out, id_to_name
 
 
+def _diagnose_orders_sheet(df: pd.DataFrame) -> dict:
+    """For the 'why is Orders wrong' diagnostic: shows whether this
+    orders-tab has its OWN explicit total-orders column (which
+    _extract_orders always prefers when present) versus what summing
+    its day-by-day columns instead would give -- so a mismatch between
+    the two is immediately visible without guessing. Mirrors
+    _extract_orders() row-by-row EXACTLY (skipping grand-total/summary
+    rows AND rows with no usable Driver ID) so these numbers are
+    directly, honestly comparable to what the real extraction produces
+    -- not inflated by rows that wouldn't actually count."""
+    cols = list(df.columns)
+    id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
+    orders_col = _guess_column(cols, FIELD_ALIASES["total_orders"])
+    day_cols = _day_number_columns(cols)
+    found_explicit = orders_col != NONE_OPTION
+
+    explicit_sum = 0
+    day_sum = 0
+    rows_with_id = 0
+    rows_without_id = 0
+    for _, raw in df.iterrows():
+        if _row_is_summary(raw):
+            continue
+        has_id = id_col != NONE_OPTION and bool(_clean_id_value(raw[id_col]))
+        if has_id:
+            rows_with_id += 1
+        else:
+            rows_without_id += 1
+            continue  # matches _extract_orders: a row with no usable ID contributes nothing
+        if found_explicit:
+            explicit_sum += _clean_number_value(raw[orders_col], as_int=True)
+        if day_cols:
+            day_sum += sum(_clean_number_value(raw[c], as_int=True) for c in day_cols)
+
+    return {
+        "orders_col_found": found_explicit,
+        "orders_col_name": orders_col if found_explicit else None,
+        "orders_col_sum": explicit_sum if found_explicit else None,
+        "day_cols_count": len(day_cols),
+        "day_cols_sum": day_sum,
+        "used": "its own Total Orders column" if found_explicit else "summing its day-by-day columns",
+        "rows_with_id": rows_with_id,
+        "rows_without_id": rows_without_id,
+    }
+
+
 def _orders_dicts_look_like_duplicates(a: dict, b: dict) -> bool:
     common = set(a) & set(b)
     if not common or len(common) < max(1, min(len(a), len(b)) // 2):
@@ -3500,6 +3546,8 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
     override_df = None
     override_matched_name = None
     override_key = roster_tab_override.strip().lower() if roster_tab_override else None
+    orders_sheet_columns = {}  # {sheet_name: [columns]} -- for the "why is orders wrong" diagnostic
+    orders_sheet_diagnostics = {}  # {sheet_name: {...}} -- explicit-column vs day-sum comparison
 
     for sheet_name, df in frames:
         df = df.dropna(axis=0, how="all").reset_index(drop=True)
@@ -3515,8 +3563,10 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
         if kind == "roster":
             roster_candidates.append((sheet_name, df))
         elif kind == "orders":
+            orders_sheet_columns[sheet_name] = list(df.columns)
+            orders_sheet_diagnostics[sheet_name] = _diagnose_orders_sheet(df)
             orders_dict, names = _extract_orders(df)
-            orders_sheets.append(orders_dict)
+            orders_sheets.append((sheet_name, orders_dict))
             id_to_name.update(names)
         elif kind == "validity":
             validity_dict, names = _extract_validity(df)
@@ -3550,8 +3600,23 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
         roster_records = _extract_roster(scored[0][2])
 
     orders_by_id = {}
-    for od in orders_sheets:
-        for k, v in od.items():
+    duplicate_orders_sheets = []
+    kept_orders_sheets = []
+    for sheet_name, sheet_orders in orders_sheets:
+        # Same safeguard as the real Sync: if two orders tabs largely
+        # overlap on the same riders with matching numbers, they're
+        # almost certainly the same data under two names -- counting
+        # both would double a rider's orders. Only the first copy is
+        # kept; skipped ones are surfaced in the diagnostics below.
+        is_dup = any(
+            _orders_dicts_look_like_duplicates(sheet_orders, kept_dict)
+            for _, kept_dict in kept_orders_sheets
+        )
+        if is_dup:
+            duplicate_orders_sheets.append(sheet_name)
+            continue
+        kept_orders_sheets.append((sheet_name, sheet_orders))
+        for k, v in sheet_orders.items():
             orders_by_id[k] = orders_by_id.get(k, 0) + v
 
     # Match orders/validity/attendance/cancellation rows to a real
@@ -3644,6 +3709,9 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
         "roster_orders_riders": roster_orders_riders,
         "roster_orders_sum": roster_orders_sum,
         "roster_sheet_columns": roster_sheet_columns,
+        "orders_sheet_columns": orders_sheet_columns,
+        "orders_sheet_diagnostics": orders_sheet_diagnostics,
+        "duplicate_orders_sheets": duplicate_orders_sheets,
         "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
 
@@ -3812,6 +3880,49 @@ def render_live_month_panel():
                 if live.get("roster_sheet_columns"):
                     st.caption("Column headers Streamlit actually read from the roster sheet:")
                     st.code(" | ".join(str(c) for c in live["roster_sheet_columns"]), language=None)
+
+            if live.get("orders_sheet_diagnostics"):
+                st.markdown("###### Orders tab(s) -- explicit column vs. day-by-day sum")
+                for sheet_name, diag in live["orders_sheet_diagnostics"].items():
+                    st.markdown(f"**`{sheet_name}`** -- currently using: *{diag['used']}*")
+                    d1, d2 = st.columns(2)
+                    with d1:
+                        if diag["orders_col_found"]:
+                            st.metric(f"Own '{diag['orders_col_name']}' column sum", f"{diag['orders_col_sum']:,}")
+                        else:
+                            st.caption("No explicit Total Orders-style column found on this tab.")
+                    with d2:
+                        st.metric(f"Sum of {diag['day_cols_count']} day-by-day column(s)", f"{diag['day_cols_sum']:,}")
+                    if diag["orders_col_found"] and diag["day_cols_count"] > 0 and diag["orders_col_sum"] != diag["day_cols_sum"]:
+                        st.caption(
+                            "\u2139\uFE0F These two numbers differ -- since an explicit column "
+                            "was found, it's the one being used (day-by-day sum shown only "
+                            "for comparison)."
+                        )
+                    if diag.get("rows_without_id", 0) > 0:
+                        st.warning(
+                            f"\u26A0\uFE0F **{diag['rows_without_id']} row(s)** on this tab had no "
+                            f"usable Driver/Courier ID and were skipped entirely -- their orders "
+                            f"contributed **nothing** to any total. If your sheet's real total is "
+                            f"higher than what's shown here, this is very likely why: check the ID "
+                            f"column on those specific rows for blanks or a format our importer "
+                            f"can't read."
+                        )
+                    st.caption(
+                        f"Rows counted: {diag.get('rows_with_id', 0)} "
+                        f"(skipped for missing ID: {diag.get('rows_without_id', 0)})"
+                    )
+                    st.caption("Column headers on this tab:")
+                    st.code(" | ".join(str(c) for c in live["orders_sheet_columns"].get(sheet_name, [])), language=None)
+
+            if live.get("duplicate_orders_sheets"):
+                st.warning(
+                    "\u26A0\uFE0F These orders tab(s) looked like a near-duplicate of another "
+                    "one already counted (same riders, matching numbers) and were **excluded** "
+                    "to avoid double-counting: " + ", ".join(f"`{n}`" for n in live["duplicate_orders_sheets"])
+                )
+
+
             report_df = pd.DataFrame(live["sheet_report"], columns=["Tab", "Detected as", "Rows"])
             st.dataframe(report_df, use_container_width=True, hide_index=True)
 
