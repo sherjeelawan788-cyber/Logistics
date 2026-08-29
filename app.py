@@ -3041,7 +3041,15 @@ def _diagnose_orders_sheet(df: pd.DataFrame) -> dict:
     _extract_orders() row-by-row EXACTLY (skipping grand-total/summary
     rows AND rows with no usable Driver ID) so these numbers are
     directly, honestly comparable to what the real extraction produces
-    -- not inflated by rows that wouldn't actually count."""
+    -- not inflated by rows that wouldn't actually count.
+
+    Also flags a DIFFERENT, sneakier problem: two different day-column
+    HEADERS that both resolve to the same calendar day (e.g. a bare
+    '8' column AND some other column -- a stray weekly-total, a typo'd
+    duplicate -- that also happens to parse as day 8). When that
+    happens, that one day's orders get counted twice (once per
+    matching column) for every rider, inflating just that single day
+    far above its neighbors."""
     cols = list(df.columns)
     id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
     orders_col = _guess_column(cols, FIELD_ALIASES["total_orders"])
@@ -3066,6 +3074,15 @@ def _diagnose_orders_sheet(df: pd.DataFrame) -> dict:
         if day_cols:
             day_sum += sum(_clean_number_value(raw[c], as_int=True) for c in day_cols)
 
+    day_column_map = []
+    day_num_counts = {}
+    for c in day_cols:
+        dn = _day_column_to_daynum(c)
+        day_column_map.append((str(c), dn))
+        if dn is not None:
+            day_num_counts[dn] = day_num_counts.get(dn, 0) + 1
+    colliding_days = sorted(dn for dn, cnt in day_num_counts.items() if cnt > 1)
+
     return {
         "orders_col_found": found_explicit,
         "orders_col_name": orders_col if found_explicit else None,
@@ -3075,6 +3092,8 @@ def _diagnose_orders_sheet(df: pd.DataFrame) -> dict:
         "used": "its own Total Orders column" if found_explicit else "summing its day-by-day columns",
         "rows_with_id": rows_with_id,
         "rows_without_id": rows_without_id,
+        "day_column_map": day_column_map,
+        "colliding_days": colliding_days,
     }
 
 
@@ -4114,12 +4133,31 @@ def render_live_month_panel():
                             f"column on those specific rows for blanks or a format our importer "
                             f"can't read."
                         )
+                    if diag.get("colliding_days"):
+                        days_str = ", ".join(f"Day {d}" for d in diag["colliding_days"])
+                        st.error(
+                            f"\u26A0\uFE0F **Two or more columns on this tab both resolve to the "
+                            f"SAME calendar day** ({days_str}) -- every rider's orders for that day "
+                            f"are being counted once per matching column, inflating just that one "
+                            f"day far above its neighbors. Check the full column list below for a "
+                            f"stray duplicate, a weekly-total column, or a typo'd header that "
+                            f"accidentally looks like a date."
+                        )
                     st.caption(
                         f"Rows counted: {diag.get('rows_with_id', 0)} "
                         f"(skipped for missing ID: {diag.get('rows_without_id', 0)})"
                     )
                     st.caption("Column headers on this tab:")
                     st.code(" | ".join(str(c) for c in live["orders_sheet_columns"].get(sheet_name, [])), language=None)
+                    if diag.get("day_column_map"):
+                        st.caption("Every day-column header \u2192 the calendar day it resolved to:")
+                        st.code(
+                            "\n".join(
+                                f"{header!r:>30}  ->  Day {dn}" if dn is not None else f"{header!r:>30}  ->  (not resolved)"
+                                for header, dn in diag["day_column_map"]
+                            ),
+                            language=None,
+                        )
 
             if live.get("duplicate_orders_sheets"):
                 st.warning(
