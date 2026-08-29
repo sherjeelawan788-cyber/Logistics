@@ -3511,6 +3511,20 @@ def fetch_gsheet_frames(sheet_id: str) -> list:
     return frames
 
 
+def _filter_ignored_tabs(frames: list, ignored_tabs) -> list:
+    """Drop any (sheet_name, df) pair the Admin has explicitly marked
+    to ignore (case-insensitive, whitespace-trimmed) -- e.g. a
+    'PT ORDERS REPOER' tab covering a different order type that
+    shouldn't count toward the main totals. Applied identically before
+    BOTH the real Sync and the live view, so the two always agree."""
+    if not ignored_tabs:
+        return frames
+    ignored_set = {t.strip().lower() for t in ignored_tabs if t.strip()}
+    if not ignored_set:
+        return frames
+    return [(name, df) for name, df in frames if name.strip().lower() not in ignored_set]
+
+
 def sync_month_from_gsheet(sheet_id: str, month_year: str, roster_tab_override: str = None) -> dict:
     """Pull the whole Google Sheet and import it into the database for
     month_year, using the exact same engine as a manual Excel upload.
@@ -3519,6 +3533,8 @@ def sync_month_from_gsheet(sheet_id: str, month_year: str, roster_tab_override: 
     _process_sheet_frames -- forces a specific tab name to be used as
     the roster instead of auto-scoring."""
     frames = fetch_gsheet_frames(sheet_id)
+    config = _load_gsheet_config() or {}
+    frames = _filter_ignored_tabs(frames, config.get("ignored_tabs"))
     return _process_sheet_frames(frames, month_year, roster_tab_override=roster_tab_override)
 
 
@@ -3535,6 +3551,8 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
     _process_sheet_frames -- forces a specific tab name to be used as
     the roster instead of auto-scoring."""
     frames = fetch_gsheet_frames(sheet_id)
+    config = _load_gsheet_config() or {}
+    frames = _filter_ignored_tabs(frames, config.get("ignored_tabs"))
 
     roster_candidates = []
     orders_sheets = []
@@ -4034,6 +4052,30 @@ token_uri = "https://oauth2.googleapis.com/token"
         _update_gsheet_config(roster_tab_override=roster_override_input.strip() or None)
         st.session_state.pop("live_month_cache", None)
         st.success("Saved.")
+        st.rerun()
+
+    st.markdown("---")
+    st.markdown("#### \U0001F6AB Tabs to Ignore")
+    st.caption(
+        "List any tab(s) that should be completely skipped -- never counted "
+        "toward orders, validity, headcount, or anything else -- even if they'd "
+        "otherwise be auto-detected as an orders/validity/roster sheet. Useful "
+        "for a tab covering a different order type or category you don't want "
+        "mixed into the main totals (e.g. 'PT ORDERS REPOER'). One tab name "
+        "per line, exact spelling (case doesn't matter)."
+    )
+    ignored_tabs_input = st.text_area(
+        "Tab names to ignore",
+        value="\n".join(config.get("ignored_tabs") or []),
+        placeholder="e.g.\nPT ORDERS REPOER\nScheduling",
+        key="ignored_tabs_input",
+        height=100,
+    )
+    if st.button("\U0001F4BE Save Ignored Tabs", use_container_width=True):
+        tabs_list = [line.strip() for line in ignored_tabs_input.splitlines() if line.strip()]
+        _update_gsheet_config(ignored_tabs=tabs_list)
+        st.session_state.pop("live_month_cache", None)
+        st.success(f"Saved -- {len(tabs_list)} tab(s) will now be skipped entirely." if tabs_list else "Saved -- no tabs ignored.")
         st.rerun()
 
     st.markdown("---")
