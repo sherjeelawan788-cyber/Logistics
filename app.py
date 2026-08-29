@@ -279,28 +279,34 @@ def stat_cards(cards: list) -> None:
     st.markdown("".join(html), unsafe_allow_html=True)
 
 
-def render_clickable_stat_row(cards: list, row_key: str) -> None:
+def render_clickable_stat_row(cards: list, row_key: str, state_key: str = "active_drill") -> None:
     """Real, clickable stat cards -- each card IS an actual Streamlit
     button (styled via CSS to keep the same gradient/icon/rounded-card
     look), not a decorative div with a separate invisible button placed
     behind it. A click always lands on the real control this way --
     that's the fix for the earlier version, where the invisible overlay
     button could end up misaligned with the pretty card drawn on top of
-    it and silently eat clicks."""
+    it and silently eat clicks.
+
+    state_key: which session_state key tracks the active card. Defaults
+    to "active_drill" (Operations Dashboard's original behavior,
+    unchanged); pass a different key for an independent set of cards
+    elsewhere (e.g. Rider Lookup) so the two don't fight over the same
+    "currently open" state."""
     cols = st.columns(len(cards))
     for i, c in enumerate(cards):
         card_id = f"{row_key}_{i}"
         variant = c.get("variant", "a")
-        is_active = st.session_state.get("active_drill") == card_id
+        is_active = st.session_state.get(state_key) == card_id
         label = f"{c.get('icon', '')}\n\n{c['label']}\n\n**{c['value']}**"
         active_flag = "__active" if is_active else ""
         with cols[i]:
-            with st.container(key=f"clickcard_{card_id}__v{variant}{active_flag}"):
-                clicked = st.button(label, key=f"clickbtn_{card_id}", use_container_width=True)
+            with st.container(key=f"clickcard_{state_key}_{card_id}__v{variant}{active_flag}"):
+                clicked = st.button(label, key=f"clickbtn_{state_key}_{card_id}", use_container_width=True)
                 if c.get("tip"):
                     st.caption(c["tip"])
                 if clicked:
-                    st.session_state["active_drill"] = None if is_active else card_id
+                    st.session_state[state_key] = None if is_active else card_id
                     st.rerun()
 
 
@@ -1092,6 +1098,20 @@ def init_db() -> None:
             first_seen TEXT,
             last_seen TEXT,
             visit_count INTEGER NOT NULL DEFAULT 1
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_logs (
+            driver_id   TEXT NOT NULL,
+            month_year  TEXT NOT NULL,
+            day         INTEGER NOT NULL,
+            orders      INTEGER,
+            validity    TEXT,
+            attendance  TEXT,
+            PRIMARY KEY (driver_id, month_year, day)
         );
         """
     )
@@ -2543,6 +2563,152 @@ def _day_number_columns(columns) -> list:
     return out
 
 
+def _day_column_to_daynum(col):
+    """Turn a day-by-day column header -- either a plain day number
+    ('1'..'31') or an actual date ('2026-08-15') -- into just the day-
+    of-month integer, so a driver's daily orders/validity/attendance
+    can be stored and charted against a simple 1..31 axis regardless
+    of which style the sheet uses."""
+    s = str(col).strip()
+    if s.isdigit() and 1 <= int(s) <= 31:
+        return int(s)
+    date_part = s.split(" ")[0]
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(date_part, fmt).day
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_daily_orders(df: pd.DataFrame) -> dict:
+    """driver_id -> {day_number: orders} from a day-by-day orders
+    sheet. Skipped entirely for a sheet whose orders come from a
+    single Total-Orders-style column instead of per-day columns --
+    there's no day-level detail to capture in that case."""
+    cols = list(df.columns)
+    id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
+    day_cols = _day_number_columns(cols)
+    if id_col == NONE_OPTION or not day_cols:
+        return {}
+    out = {}
+    for _, raw in df.iterrows():
+        if _row_is_summary(raw):
+            continue
+        driver_id = _clean_id_value(raw[id_col])
+        if not driver_id:
+            continue
+        day_map = out.setdefault(driver_id, {})
+        for c in day_cols:
+            daynum = _day_column_to_daynum(c)
+            if daynum is None or pd.isna(raw[c]):
+                continue
+            day_map[daynum] = day_map.get(daynum, 0) + _clean_number_value(raw[c], as_int=True)
+    return out
+
+
+def _extract_daily_validity(df: pd.DataFrame) -> dict:
+    """driver_id -> {day_number: 'Valid'/'Invalid'} from a day-by-day
+    validity sheet."""
+    cols = list(df.columns)
+    id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
+    day_cols = _day_number_columns(cols)
+    if id_col == NONE_OPTION or not day_cols:
+        return {}
+    out = {}
+    for _, raw in df.iterrows():
+        if _row_is_summary(raw):
+            continue
+        driver_id = _clean_id_value(raw[id_col])
+        if not driver_id:
+            continue
+        day_map = out.setdefault(driver_id, {})
+        for c in day_cols:
+            daynum = _day_column_to_daynum(c)
+            if daynum is None or pd.isna(raw[c]):
+                continue
+            val = str(raw[c]).strip().upper()
+            if val in ("VALID", "INVALID"):
+                day_map[daynum] = val.capitalize()
+    return out
+
+
+def _extract_daily_attendance(df: pd.DataFrame) -> dict:
+    """driver_id -> {day_number: 'Present'/'Absent'/'Off'} from a
+    day-by-day attendance sheet."""
+    cols = list(df.columns)
+    id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
+    day_cols = _day_number_columns(cols)
+    if id_col == NONE_OPTION or not day_cols:
+        return {}
+    out = {}
+    for _, raw in df.iterrows():
+        if _row_is_summary(raw):
+            continue
+        driver_id = _clean_id_value(raw[id_col])
+        if not driver_id:
+            continue
+        day_map = out.setdefault(driver_id, {})
+        for c in day_cols:
+            daynum = _day_column_to_daynum(c)
+            if daynum is None or pd.isna(raw[c]):
+                continue
+            val = str(raw[c]).strip().upper()
+            if val in ("P", "PRESENT"):
+                day_map[daynum] = "Present"
+            elif val in ("A", "ABSENT"):
+                day_map[daynum] = "Absent"
+            elif val in ("OFF", "OFFDAY", "OFF DAY", "LEAVE"):
+                day_map[daynum] = "Off"
+    return out
+
+
+def upsert_daily_logs(conn: sqlite3.Connection, month_year: str, daily_orders: dict,
+                       daily_validity: dict, daily_attendance: dict) -> int:
+    """Merge per-day orders/validity/attendance maps (each driver_id ->
+    {day: value}) into the daily_logs table for month_year. Existing
+    rows are updated in place (same UPSERT-and-COALESCE philosophy as
+    merge_monthly_log) so re-syncing the same month never duplicates
+    or wipes out a field a different sheet already filled in."""
+    all_driver_ids = set(daily_orders) | set(daily_validity) | set(daily_attendance)
+    rows_written = 0
+    for driver_id in all_driver_ids:
+        days = (
+            set(daily_orders.get(driver_id, {}))
+            | set(daily_validity.get(driver_id, {}))
+            | set(daily_attendance.get(driver_id, {}))
+        )
+        for day in days:
+            orders_val = daily_orders.get(driver_id, {}).get(day)
+            validity_val = daily_validity.get(driver_id, {}).get(day)
+            attendance_val = daily_attendance.get(driver_id, {}).get(day)
+            conn.execute(
+                """
+                INSERT INTO daily_logs (driver_id, month_year, day, orders, validity, attendance)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(driver_id, month_year, day) DO UPDATE SET
+                    orders     = COALESCE(excluded.orders, daily_logs.orders),
+                    validity   = COALESCE(excluded.validity, daily_logs.validity),
+                    attendance = COALESCE(excluded.attendance, daily_logs.attendance)
+                """,
+                (driver_id, month_year, day, orders_val, validity_val, attendance_val),
+            )
+            rows_written += 1
+    return rows_written
+
+
+def load_daily_logs(driver_id: str, month_year: str) -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT day, orders, validity, attendance FROM daily_logs "
+        "WHERE driver_id = ? AND month_year = ? ORDER BY day",
+        conn,
+        params=(driver_id, month_year),
+    )
+    conn.close()
+    return df
+
+
 def _classify_sheet(df: pd.DataFrame) -> str:
     cols = list(df.columns)
 
@@ -3105,6 +3271,14 @@ def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors
     override_matched_name = None
     override_key = roster_tab_override.strip().lower() if roster_tab_override else None
 
+    # Day-by-day detail (driver_id -> {day: value}), merged across
+    # every orders/validity/attendance sheet seen -- captured here
+    # purely for the Rider Lookup day-by-day drilldown/chart; none of
+    # this changes the existing monthly totals logic below.
+    daily_orders_all = {}
+    daily_validity_all = {}
+    daily_attendance_all = {}
+
     for sheet_name, df in sheet_frames:
         df = df.dropna(axis=0, how="all").reset_index(drop=True)
         df.columns = _dedupe_headers([str(c).strip() for c in df.columns])
@@ -3124,14 +3298,22 @@ def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors
             orders_dict, names = _extract_orders(df)
             orders_sheets.append((sheet_name, orders_dict))
             id_to_name.update(names)
+            for did, day_map in _extract_daily_orders(df).items():
+                merged = daily_orders_all.setdefault(did, {})
+                for day, val in day_map.items():
+                    merged[day] = merged.get(day, 0) + val
         elif kind == "validity":
             validity_dict, names = _extract_validity(df)
             validity_by_id.update(validity_dict)
             id_to_name.update(names)
+            for did, day_map in _extract_daily_validity(df).items():
+                daily_validity_all.setdefault(did, {}).update(day_map)
         elif kind == "attendance":
             attendance_dict, names = _extract_attendance(df)
             attendance_by_id.update(attendance_dict)
             id_to_name.update(names)
+            for did, day_map in _extract_daily_attendance(df).items():
+                daily_attendance_all.setdefault(did, {}).update(day_map)
         elif kind == "cancellation":
             for k, v in _extract_cancellations_by_name(df).items():
                 cancellations_by_name[k] = cancellations_by_name.get(k, 0) + v
@@ -3210,6 +3392,9 @@ def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors
     orders_by_id = _remap_ids_by_name(orders_by_id, id_to_name, name_to_id, known_driver_ids)
     validity_by_id = _remap_ids_by_name(validity_by_id, id_to_name, name_to_id, known_driver_ids)
     attendance_by_id = _remap_ids_by_name(attendance_by_id, id_to_name, name_to_id, known_driver_ids)
+    daily_orders_all = _remap_ids_by_name(daily_orders_all, id_to_name, name_to_id, known_driver_ids)
+    daily_validity_all = _remap_ids_by_name(daily_validity_all, id_to_name, name_to_id, known_driver_ids)
+    daily_attendance_all = _remap_ids_by_name(daily_attendance_all, id_to_name, name_to_id, known_driver_ids)
 
     # If the roster tab itself carries a per-rider order total (see
     # _extract_roster), that figure wins over whatever a separate
@@ -3315,6 +3500,8 @@ def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors
             (month_year, *roster_records.keys()),
         )
 
+    daily_rows_written = upsert_daily_logs(conn, month_year, daily_orders_all, daily_validity_all, daily_attendance_all)
+
     conn.commit()
     conn.close()
 
@@ -3334,6 +3521,7 @@ def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors
         "roster_sheets_skipped": roster_sheets_skipped,
         "extra_riders_from_skipped": extra_riders_from_skipped,
         "roster_override_requested_but_not_found": roster_override_requested_but_not_found,
+        "daily_rows_written": daily_rows_written,
     }
     return summary
 
@@ -4509,6 +4697,109 @@ def _render_single_sheet_upload(uploaded_file, sheet_name):
 # ==============================================================================
 
 
+def render_rider_drilldown_panel(state_key: str, drill_defs: dict) -> None:
+    """Like render_drilldown_panel (Operations Dashboard), but with its
+    own independent session_state key AND richer content than a plain
+    table: a day-by-day orders chart+table, a day-by-day validity/
+    attendance table, or a simple explanatory message for figures that
+    have no daily breakdown at all (salary, deductions -- recorded
+    once a month, not per day). drill_defs is
+    {card_id: {"title", "kind", ...}} where kind is "daily_orders",
+    "daily_status", or "message"."""
+    active = st.session_state.get(state_key)
+    if not active or active not in drill_defs:
+        return
+    spec = drill_defs[active]
+    with st.container(key=f"drill_panel_box_{state_key}"):
+        c1, c2 = st.columns([6, 1])
+        c1.markdown(f"##### \U0001F50E {spec['title']}")
+        if c2.button("\u2715 Close", key=f"close_drill_btn_{state_key}", use_container_width=True):
+            st.session_state[state_key] = None
+            st.rerun()
+        if spec.get("note"):
+            st.caption(spec["note"])
+
+        kind = spec.get("kind")
+        if kind == "daily_orders":
+            df = spec["df"]
+            if df.empty:
+                st.caption("No day-by-day data on file for this month yet.")
+            else:
+                st.bar_chart(df.set_index("Date")["Orders"])
+                st.dataframe(df, use_container_width=True, hide_index=True)
+        elif kind == "daily_status":
+            df = spec["df"]
+            if df.empty:
+                st.caption("No day-by-day data on file for this month yet.")
+            else:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+        elif kind == "message":
+            st.info(spec.get("message", "No further detail available."))
+
+
+def _rider_month_trend(rider_logs: pd.DataFrame, sel_month: str, column: str):
+    """Compares sel_month's value in `column` to the most recent
+    EARLIER month on file for this rider. Returns (delta, pct_change,
+    previous_month) or None if there's no earlier month to compare
+    against yet."""
+    earlier = rider_logs[rider_logs["month_year"] < sel_month].sort_values("month_year")
+    if earlier.empty:
+        return None
+    prev_row = earlier.iloc[-1]
+    prev_val = float(prev_row[column] or 0)
+    cur_rows = rider_logs[rider_logs["month_year"] == sel_month]
+    if cur_rows.empty:
+        return None
+    cur_val = float(cur_rows[column].iloc[0] or 0)
+    delta = cur_val - prev_val
+    pct = (delta / prev_val * 100) if prev_val else (100.0 if cur_val > 0 else 0.0)
+    return delta, pct, prev_row["month_year"]
+
+
+def render_rider_performance_trend(rider_logs: pd.DataFrame, sel_month: str) -> None:
+    """A small, honest 'is this rider trending up or down' strip,
+    comparing sel_month to whichever earlier month is on file for
+    them -- orders trending up is good, cancellations trending up is
+    bad, so each is judged on its own terms rather than one combined
+    score. Says nothing at all if there's no earlier month yet (first
+    month on file has nothing to compare against)."""
+    orders_trend = _rider_month_trend(rider_logs, sel_month, "total_orders")
+    cancel_trend = _rider_month_trend(rider_logs, sel_month, "cancelled_orders")
+    if not orders_trend and not cancel_trend:
+        return
+
+    parts = []
+    if orders_trend:
+        delta, pct, prev_month = orders_trend
+        if delta > 0:
+            parts.append(f"\U0001F4C8 Orders up {pct:.0f}% vs {month_display(prev_month)}")
+        elif delta < 0:
+            parts.append(f"\U0001F4C9 Orders down {abs(pct):.0f}% vs {month_display(prev_month)}")
+        else:
+            parts.append(f"\u27A1\uFE0F Orders unchanged vs {month_display(prev_month)}")
+    if cancel_trend:
+        delta, pct, prev_month = cancel_trend
+        # Lower cancellations is the improvement here, so the arrow
+        # direction is intentionally the OPPOSITE of the orders one.
+        if delta < 0:
+            parts.append(f"\U0001F4C9 Cancellations down {abs(pct):.0f}% vs {month_display(prev_month)}")
+        elif delta > 0:
+            parts.append(f"\U0001F4C8 Cancellations up {pct:.0f}% vs {month_display(prev_month)}")
+        else:
+            parts.append(f"\u27A1\uFE0F Cancellations unchanged vs {month_display(prev_month)}")
+
+    st.markdown(
+        f"""
+        <div style="border-radius:12px; padding:10px 16px; margin:4px 0 14px 0;
+                    background:linear-gradient(135deg, rgba(59,130,246,0.10), rgba(34,197,94,0.08));
+                    border:1px solid rgba(120,120,120,0.18); font-size:13.5px;">
+          {" &nbsp;\u2022&nbsp; ".join(parts)}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_month_reveal_cards(rows: pd.DataFrame, join_date: str, vehicle_type: str):
     css = """
     <style>
@@ -4673,7 +4964,63 @@ def render_rider_lookup(filters: dict):
         st.info(f"No log on file for this rider in {month_display(sel_month)}.")
     else:
         row = month_rows.iloc[0]
-        stat_cards([
+        render_rider_performance_trend(rider_logs, sel_month)
+        st.caption("\U0001F446 Tap any card to see the day-by-day detail behind that number.")
+
+        daily_df = load_daily_logs(driver_id, sel_month)
+        if not daily_df.empty:
+            daily_df = daily_df.copy()
+            daily_df["Date"] = daily_df["day"].apply(lambda d: f"{sel_month}-{int(d):02d}")
+
+        orders_daily_df = pd.DataFrame()
+        status_daily_df = pd.DataFrame()
+        if not daily_df.empty:
+            od = daily_df[daily_df["orders"].notna()][["Date", "orders"]].rename(columns={"orders": "Orders"})
+            orders_daily_df = od.sort_values("Date").reset_index(drop=True)
+            sd = daily_df[daily_df["validity"].notna() | daily_df["attendance"].notna()][
+                ["Date", "validity", "attendance"]
+            ].rename(columns={"validity": "Validity", "attendance": "Attendance"})
+            status_daily_df = sd.sort_values("Date").reset_index(drop=True)
+
+        drill_defs = {
+            "rider_row1_0": {
+                "title": "Orders -- day by day", "kind": "daily_orders", "df": orders_daily_df,
+                "note": "From the day-by-day orders sheet, when available." if not orders_daily_df.empty else None,
+            },
+            "rider_row1_1": {
+                "title": "Cancelled Orders", "kind": "message",
+                "message": (
+                    f"{int(row['cancelled_orders'] or 0)} cancelled order(s) this month. Only a monthly "
+                    f"total is tracked for cancellations -- day-by-day detail isn't available."
+                ),
+            },
+            "rider_row1_2": {
+                "title": "Gross Salary", "kind": "message",
+                "message": f"SAR {(row['gross_salary'] or 0):,.0f} for {month_display(sel_month)}. Salary figures are recorded once per month, not per day.",
+            },
+            "rider_row1_3": {
+                "title": "Pending Salary", "kind": "message",
+                "message": f"SAR {(row['pending_salary'] or 0):,.0f} still owed for {month_display(sel_month)}.",
+            },
+            "rider_row2_0": {
+                "title": "Deductions", "kind": "message",
+                "message": f"SAR {(row['total_deductions'] or 0):,.0f} deducted for {month_display(sel_month)}.",
+            },
+            "rider_row2_1": {
+                "title": "Net Salary", "kind": "message",
+                "message": f"SAR {(row['net_salary'] or 0):,.0f} net for {month_display(sel_month)} (gross minus deductions).",
+            },
+            "rider_row2_2": {
+                "title": "Days Worked / Attendance -- day by day", "kind": "daily_status", "df": status_daily_df,
+                "note": "Validity and/or attendance, whichever this month's sheets recorded." if not status_daily_df.empty else None,
+            },
+            "rider_row2_3": {
+                "title": "Validity -- day by day", "kind": "daily_status", "df": status_daily_df,
+                "note": "Validity and/or attendance, whichever this month's sheets recorded." if not status_daily_df.empty else None,
+            },
+        }
+
+        render_clickable_stat_row([
             {"icon": "\U0001F4E6", "label": "Orders", "value": f"{int(row['total_orders'] or 0):,}",
              "tip": "Completed orders this month", "variant": "a"},
             {"icon": "\u274C", "label": "Cancelled", "value": f"{int(row['cancelled_orders'] or 0):,}",
@@ -4682,8 +5029,11 @@ def render_rider_lookup(filters: dict):
              "tip": "Before deductions, this month", "variant": "b"},
             {"icon": "\u23F3", "label": "Pending", "value": f"SAR {(row['pending_salary'] or 0):,.0f}",
              "tip": "Still owed for this month", "variant": "d"},
-        ])
-        stat_cards([
+        ], row_key="rider_row1", state_key="rider_drill")
+        if (st.session_state.get("rider_drill") or "").startswith("rider_row1_"):
+            render_rider_drilldown_panel("rider_drill", drill_defs)
+
+        render_clickable_stat_row([
             {"icon": "\u2796", "label": "Deductions", "value": f"SAR {(row['total_deductions'] or 0):,.0f}",
              "tip": "Deducted this month", "variant": "c"},
             {"icon": "\u2705", "label": "Net Salary", "value": f"SAR {(row['net_salary'] or 0):,.0f}",
@@ -4692,7 +5042,9 @@ def render_rider_lookup(filters: dict):
              "tip": "Attendance this month", "variant": "b"},
             {"icon": "\u2139\uFE0F", "label": "Validity", "value": row['validity_status'] or "N/A",
              "tip": "Validity status for this month", "variant": "d"},
-        ])
+        ], row_key="rider_row2", state_key="rider_drill")
+        if (st.session_state.get("rider_drill") or "").startswith("rider_row2_"):
+            render_rider_drilldown_panel("rider_drill", drill_defs)
 
     with st.expander("\U0001F4CA Lifetime Totals (all months combined)"):
         stat_cards([
