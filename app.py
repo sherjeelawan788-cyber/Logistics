@@ -24,6 +24,8 @@ sidebar to populate the database with realistic demo data for testing.
 """
 
 import hashlib
+import io
+import zipfile
 import json
 import os
 import random
@@ -1346,6 +1348,44 @@ def clear_all_data() -> None:
     conn.close()
 
 
+# ==============================================================================
+# BACKUP / RESTORE  -- Streamlit Community Cloud wipes local files (the
+# SQLite DB, hq_owner.json, hq_gsheet.json) on every redeploy, since
+# they're server-local and never part of the git repo. Backing up
+# before a code push and restoring right after is the practical
+# workaround until/unless the app is moved to persistent cloud storage.
+# ==============================================================================
+
+def build_backup_zip() -> bytes:
+    """Package every local file that would otherwise be lost on a
+    redeploy (the database, the Admin login, the Google Sheet
+    connection settings) into one downloadable .zip."""
+    backup_files = [DB_PATH, OWNER_CONFIG_PATH, "hq_gsheet.json"]
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in backup_files:
+            if os.path.exists(path):
+                zf.write(path, arcname=os.path.basename(path))
+    return buffer.getvalue()
+
+
+def restore_backup_zip(uploaded_file) -> list:
+    """Extracts a backup .zip built by build_backup_zip() and writes
+    its files back to disk, overwriting whatever's currently there.
+    Returns the list of filenames actually restored."""
+    backup_files = [DB_PATH, OWNER_CONFIG_PATH, "hq_gsheet.json"]
+    restored = []
+    with zipfile.ZipFile(uploaded_file) as zf:
+        names = set(zf.namelist())
+        for path in backup_files:
+            fname = os.path.basename(path)
+            if fname in names:
+                with zf.open(fname) as src, open(path, "wb") as dst:
+                    dst.write(src.read())
+                restored.append(fname)
+    return restored
+
+
 def delete_month_data(month_year: str) -> dict:
     """Wipes just ONE month's data -- monthly_logs rows and the
     company-level salary_summary row for that month -- while leaving
@@ -1509,6 +1549,42 @@ def render_sidebar():
                 clear_all_data()
                 st.success("Database cleared.")
                 st.rerun()
+
+        with st.sidebar.expander("\U0001F4BE Backup & Restore", expanded=False):
+            st.caption(
+                "\u26A0\uFE0F **Do this before every code update.** Streamlit Cloud wipes "
+                "this app's saved data (database, Admin login, Google Sheet connection) "
+                "every time you push new code and it redeploys -- those files live only "
+                "on the server, never in GitHub. Download a backup first, push your code, "
+                "then restore the backup right after."
+            )
+            st.download_button(
+                "\u2B07\uFE0F Download Backup (.zip)",
+                data=build_backup_zip(),
+                file_name=f"logistics_backup_{datetime.today().strftime('%Y-%m-%d')}.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+            st.markdown("---")
+            restore_file = st.file_uploader(
+                "Restore from a backup .zip", type=["zip"], key="restore_backup_uploader",
+            )
+            if restore_file is not None:
+                st.warning(
+                    "\u26A0\uFE0F This will overwrite the current database, Admin login, "
+                    "and Google Sheet connection with whatever's in this backup file."
+                )
+                if st.button("\u267B\uFE0F Restore This Backup", use_container_width=True, type="primary"):
+                    try:
+                        restored = restore_backup_zip(restore_file)
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"Couldn't restore this backup: {exc}")
+                    else:
+                        if restored:
+                            st.success(f"Restored: {', '.join(restored)}. Reloading...")
+                            st.rerun()
+                        else:
+                            st.error("This .zip didn't contain any recognizable backup files.")
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### \U0001F50E Global Filters")
