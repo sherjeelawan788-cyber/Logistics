@@ -2551,7 +2551,7 @@ def _day_number_columns(columns) -> list:
             continue
         date_part = s.split(" ")[0]
         matched = False
-        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%m-%Y"):
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y"):
             try:
                 datetime.strptime(date_part, fmt)
                 matched = True
@@ -2568,12 +2568,22 @@ def _day_column_to_daynum(col):
     ('1'..'31') or an actual date ('2026-08-15') -- into just the day-
     of-month integer, so a driver's daily orders/validity/attendance
     can be stored and charted against a simple 1..31 axis regardless
-    of which style the sheet uses."""
+    of which style the sheet uses.
+
+    DD/MM/YYYY is tried BEFORE MM/DD/YYYY -- not the other way round.
+    Both are ambiguous for a header like '01/08/2026', but trying
+    MM/DD first silently mis-happy-parses every one of '01/08'..'12/08'
+    as 'month=that number, day=8' (since 8 is a valid day in any
+    month), collapsing 12 different days' worth of data into a single
+    'day 8' bucket. DD/MM/YYYY is both the far more common convention
+    for the sheets this importer actually sees, and self-correcting
+    where it matters: a header with day > 12 (e.g. '13/08/2026') can
+    ONLY be DD/MM anyway, since no month exceeds 12."""
     s = str(col).strip()
     if s.isdigit() and 1 <= int(s) <= 31:
         return int(s)
     date_part = s.split(" ")[0]
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%m-%Y"):
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y"):
         try:
             return datetime.strptime(date_part, fmt).day
         except ValueError:
