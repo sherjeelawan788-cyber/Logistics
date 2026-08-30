@@ -55,6 +55,9 @@ except ImportError:  # noqa: BLE001
 # ==============================================================================
 DB_PATH = "logistics.db"
 OWNER_CONFIG_PATH = "hq_owner.json"
+VALIDITY_TARGETS_PATH = "hq_validity_targets.json"
+DEFAULT_MIN_ORDERS_FOR_VALID = 330
+DEFAULT_MIN_DAYS_FOR_VALID = 26
 
 DRIVER_STATUSES = ["Active", "Terminated", "Suspended"]
 VEHICLE_TYPES = ["Company Car", "Own Car"]
@@ -1349,6 +1352,46 @@ def clear_all_data() -> None:
 
 
 # ==============================================================================
+# VALIDITY TARGETS  -- "Valid" / "Invalid" here means the rider hit BOTH a
+# minimum monthly order count AND a minimum days-worked count -- a whole-
+# month performance target, not the raw day-by-day VALID/INVALID marks a
+# Validity Report sheet might carry (a rider who worked every day but fell
+# short on total orders should still show Invalid; the reverse too).
+# ==============================================================================
+
+
+def _load_validity_targets() -> dict:
+    if not os.path.exists(VALIDITY_TARGETS_PATH):
+        return {"min_orders": DEFAULT_MIN_ORDERS_FOR_VALID, "min_days": DEFAULT_MIN_DAYS_FOR_VALID}
+    try:
+        with open(VALIDITY_TARGETS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {
+            "min_orders": int(data.get("min_orders", DEFAULT_MIN_ORDERS_FOR_VALID)),
+            "min_days": int(data.get("min_days", DEFAULT_MIN_DAYS_FOR_VALID)),
+        }
+    except Exception:  # noqa: BLE001
+        return {"min_orders": DEFAULT_MIN_ORDERS_FOR_VALID, "min_days": DEFAULT_MIN_DAYS_FOR_VALID}
+
+
+def _save_validity_targets(min_orders: int, min_days: int) -> None:
+    with open(VALIDITY_TARGETS_PATH, "w", encoding="utf-8") as f:
+        json.dump({"min_orders": int(min_orders), "min_days": int(min_days)}, f)
+
+
+def compute_performance_validity(total_orders, days_worked, min_orders: int, min_days: int) -> str:
+    """Whole-month performance classification: Valid only when BOTH the
+    order count and the days-worked count meet their targets for the
+    month -- 500 orders in only 20 days is still Invalid; 26 days
+    worked with only 200 orders is still Invalid too."""
+    orders = total_orders or 0
+    days = days_worked or 0
+    if orders < min_orders or days < min_days:
+        return "Invalid"
+    return "Valid"
+
+
+# ==============================================================================
 # BACKUP / RESTORE  -- Streamlit Community Cloud wipes local files (the
 # SQLite DB, hq_owner.json, hq_gsheet.json) on every redeploy, since
 # they're server-local and never part of the git repo. Backing up
@@ -1360,7 +1403,7 @@ def build_backup_zip() -> bytes:
     """Package every local file that would otherwise be lost on a
     redeploy (the database, the Admin login, the Google Sheet
     connection settings) into one downloadable .zip."""
-    backup_files = [DB_PATH, OWNER_CONFIG_PATH, "hq_gsheet.json"]
+    backup_files = [DB_PATH, OWNER_CONFIG_PATH, "hq_gsheet.json", VALIDITY_TARGETS_PATH]
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in backup_files:
@@ -1373,7 +1416,7 @@ def restore_backup_zip(uploaded_file) -> list:
     """Extracts a backup .zip built by build_backup_zip() and writes
     its files back to disk, overwriting whatever's currently there.
     Returns the list of filenames actually restored."""
-    backup_files = [DB_PATH, OWNER_CONFIG_PATH, "hq_gsheet.json"]
+    backup_files = [DB_PATH, OWNER_CONFIG_PATH, "hq_gsheet.json", VALIDITY_TARGETS_PATH]
     restored = []
     with zipfile.ZipFile(uploaded_file) as zf:
         names = set(zf.namelist())
@@ -1589,6 +1632,26 @@ def render_sidebar():
     st.sidebar.markdown("---")
     st.sidebar.markdown("### \U0001F50E Global Filters")
 
+    if is_admin():
+        with st.sidebar.expander("\U0001F3AF Validity Targets", expanded=False):
+            st.caption(
+                "A rider counts as **Valid** for the month only when BOTH targets "
+                "are met -- falling short on either one makes them Invalid."
+            )
+            targets = _load_validity_targets()
+            new_min_orders = st.number_input(
+                "Minimum orders this month", min_value=0, value=targets["min_orders"], step=10,
+                key="validity_target_orders",
+            )
+            new_min_days = st.number_input(
+                "Minimum days worked this month", min_value=0, max_value=31, value=targets["min_days"], step=1,
+                key="validity_target_days",
+            )
+            if st.button("\U0001F4BE Save Targets", use_container_width=True):
+                _save_validity_targets(new_min_orders, new_min_days)
+                st.success("Saved.")
+                st.rerun()
+
     months = distinct_months()
     supervisors = distinct_supervisors()
 
@@ -1701,22 +1764,41 @@ def render_dashboard(filters: dict):
     roster_only_for_vehicle = month_df[month_df["in_roster"] == 1].drop_duplicates(subset="driver_id")
     company_cars = (roster_only_for_vehicle["vehicle_type"] == "Company Car").sum()
     own_cars = (roster_only_for_vehicle["vehicle_type"] == "Own Car").sum()
-    valid_drivers = (month_df["validity_status"] == "Valid").sum()
-    invalid_drivers = (month_df["validity_status"] == "Invalid").sum()
+
+    # "Valid" / "Invalid" here is a whole-month PERFORMANCE target, not
+    # the raw day-by-day marks a Validity Report sheet might carry: a
+    # rider needs to clear BOTH a minimum order count and a minimum
+    # days-worked count for the month to count as Valid. See
+    # compute_performance_validity() -- thresholds are Admin-adjustable
+    # under Global Filters -> Validity Targets in the sidebar.
+    targets = _load_validity_targets()
+    month_df = month_df.copy()
+    month_df["performance_validity"] = month_df.apply(
+        lambda r: compute_performance_validity(
+            r["total_orders"], r["valid_days_in_month"], targets["min_orders"], targets["min_days"]
+        ),
+        axis=1,
+    )
+    valid_drivers = (month_df["performance_validity"] == "Valid").sum()
+    invalid_drivers = (month_df["performance_validity"] == "Invalid").sum()
 
     st.markdown(f"**Selected Month:** `{month_display(filters['month'])}`")
-    st.caption("\U0001F446 Tap any card below to see exactly which riders make up that number.")
+    st.caption(
+        f"\U0001F446 Tap any card below to see exactly which riders make up that number. "
+        f"Valid/Invalid targets: \u2265{targets['min_orders']} orders and \u2265{targets['min_days']} "
+        f"days worked this month (change under Global Filters \u2192 Validity Targets)."
+    )
 
     active_only = roster_only[_active_mask(roster_only)] if not roster_only.empty else roster_only
     terminated_only = roster_only[roster_only["status"] == "Terminated"]
     suspended_only = roster_only[roster_only["status"] == "Suspended"]
     company_car_only = roster_only_for_vehicle[roster_only_for_vehicle["vehicle_type"] == "Company Car"]
     own_car_only = roster_only_for_vehicle[roster_only_for_vehicle["vehicle_type"] == "Own Car"]
-    valid_only = month_df[month_df["validity_status"] == "Valid"]
-    invalid_only = month_df[month_df["validity_status"] == "Invalid"]
+    valid_only = month_df[month_df["performance_validity"] == "Valid"]
+    invalid_only = month_df[month_df["performance_validity"] == "Invalid"]
 
     roster_cols = ["driver_id", "driver_name", "supervisor_name", "status", "vehicle_type"]
-    validity_cols = ["driver_id", "driver_name", "valid_days_in_month", "validity_status"]
+    validity_cols = ["driver_id", "driver_name", "total_orders", "valid_days_in_month", "performance_validity"]
 
     drill_defs = {
         "row1_0": ("Total Headcount", roster_only[roster_cols].sort_values("driver_name") if not roster_only.empty else roster_only, None),
@@ -1752,9 +1834,9 @@ def render_dashboard(filters: dict):
         {"icon": "\U0001F699", "label": "Own Cars (month)", "value": int(own_cars),
          "tip": "Riders using their own vehicle", "variant": "b"},
         {"icon": "\u2705", "label": "Valid Drivers (month)", "value": int(valid_drivers),
-         "tip": "Marked Valid for this month's payroll", "variant": "a"},
+         "tip": f"Hit \u2265{targets['min_orders']} orders AND \u2265{targets['min_days']} days worked", "variant": "a"},
         {"icon": "\u274C", "label": "Invalid Drivers (month)", "value": int(invalid_drivers),
-         "tip": "Marked Invalid -- needs supervisor follow-up", "variant": "c"},
+         "tip": f"Missed the \u2265{targets['min_orders']}-order or \u2265{targets['min_days']}-day target", "variant": "c"},
     ], row_key="row2")
     if (st.session_state.get("active_drill") or "").startswith("row2_"):
         render_drilldown_panel(drill_defs)
@@ -3974,8 +4056,26 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
         elif r["vehicle_type"] == "Own Car":
             own_cars += 1
 
-    valid_count = sum(1 for v in validity_by_id.values() if v["status"] == "Valid")
-    invalid_count = sum(1 for v in validity_by_id.values() if v["status"] == "Invalid")
+    # "Valid" / "Invalid" is the same whole-month PERFORMANCE target used
+    # everywhere else -- both a minimum order count AND a minimum
+    # days-worked count for the month, not the raw day-by-day marks a
+    # Validity Report sheet might carry. Days-worked here comes from the
+    # validity sheet's own valid-day count when available, else the
+    # attendance sheet's present-day count -- same fallback the real
+    # Sync uses when writing valid_days_in_month.
+    targets = _load_validity_targets()
+    all_known_ids = set(roster_records) | set(orders_by_id) | set(validity_by_id) | set(attendance_by_id)
+    valid_count = 0
+    invalid_count = 0
+    performance_validity_by_id = {}
+    for did in all_known_ids:
+        days_worked = validity_by_id[did]["valid_days"] if did in validity_by_id else attendance_by_id.get(did, 0)
+        status = compute_performance_validity(orders_by_id.get(did, 0), days_worked, targets["min_orders"], targets["min_days"])
+        performance_validity_by_id[did] = status
+        if status == "Valid":
+            valid_count += 1
+        else:
+            invalid_count += 1
 
     all_ids = set(roster_records) | set(orders_by_id) | set(validity_by_id) | set(attendance_by_id) | set(cancellations_by_id)
     rows = []
@@ -3991,7 +4091,7 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
             "Orders So Far": orders_by_id.get(did, 0),
             "Cancelled So Far": cancellations_by_id.get(did, 0),
             "Days Worked": val["valid_days"] if val else attendance_by_id.get(did, 0),
-            "Validity": val["status"] if val else "",
+            "Validity": performance_validity_by_id.get(did, ""),
         })
     detail_df = pd.DataFrame(rows).sort_values("Name").reset_index(drop=True) if rows else pd.DataFrame()
 
@@ -4147,15 +4247,16 @@ def render_live_month_panel():
             {"icon": "\u23F8\uFE0F", "label": "Suspended", "value": live["suspended_count"],
              "tip": "Temporarily suspended / on leave", "variant": "d"},
         ])
+        _targets = _load_validity_targets()
         stat_cards([
             {"icon": "\U0001F697", "label": "Company Cars", "value": live["company_cars"],
              "tip": "Riders using a company-provided vehicle", "variant": "b"},
             {"icon": "\U0001F699", "label": "Own Cars", "value": live["own_cars"],
              "tip": "Riders using their own vehicle", "variant": "b"},
             {"icon": "\u2705", "label": "Valid (so far)", "value": live["valid_count"],
-             "tip": "Marked Valid in the validity tab", "variant": "a"},
+             "tip": f"\u2265{_targets['min_orders']} orders AND \u2265{_targets['min_days']} days worked so far", "variant": "a"},
             {"icon": "\u274C", "label": "Invalid (so far)", "value": live["invalid_count"],
-             "tip": "Marked Invalid -- needs follow-up", "variant": "c"},
+             "tip": f"Below the \u2265{_targets['min_orders']}-order or \u2265{_targets['min_days']}-day target so far", "variant": "c"},
         ])
         stat_cards([
             {"icon": "\U0001F4E6", "label": "Orders So Far", "value": f"{live['total_orders_so_far']:,}",
