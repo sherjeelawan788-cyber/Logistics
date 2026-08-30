@@ -4773,7 +4773,7 @@ def render_rider_drilldown_panel(state_key: str, drill_defs: dict) -> None:
             if df.empty:
                 st.caption("No day-by-day data on file for this month yet.")
             else:
-                st.bar_chart(df.set_index("Date")["Orders"])
+                st.bar_chart(df.set_index("Date")["Orders"], height=180)
                 st.dataframe(df, use_container_width=True, hide_index=True)
         elif kind == "daily_status":
             df = spec["df"]
