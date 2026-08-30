@@ -1562,7 +1562,6 @@ def apply_filters(df: pd.DataFrame, filters: dict, month_scoped: bool = True) ->
 
 def render_dashboard(filters: dict):
     st.subheader("\U0001F4CA Operations & Workforce KPI Dashboard")
-    render_live_month_panel()
 
     merged = load_merged()
     if merged.empty:
@@ -3985,6 +3984,27 @@ def maybe_auto_sync_gsheet() -> None:
         pass  # will simply retry next time the Admin opens the app
 
 
+def render_live_tracker_tab():
+    st.subheader("\U0001F4E1 Live Tracker (Google Sheets)")
+    st.write(
+        "A real-time read straight from your connected Google Sheet -- separate from "
+        "the Operations Dashboard, which only ever shows data that's been **saved** "
+        "into permanent history. Use this tab to see today's numbers as supervisors "
+        "enter them, and to save the current month whenever you're ready."
+    )
+    config = _load_gsheet_config()
+    if not config or not config.get("sheet_id"):
+        st.info(
+            "No Google Sheet connected yet. Go to **Upload Monthly Data \u2192 Google "
+            "Sheet Sync** to connect one."
+        )
+        return
+    if not GSPREAD_AVAILABLE:
+        st.error("The 'gspread' and 'google-auth' packages aren't installed on this server.")
+        return
+    render_live_month_panel()
+
+
 def render_live_month_panel():
     """The full 'This Month So Far' picture, sourced directly from the
     connected Google Sheet -- not from the database. Nothing here is
@@ -3999,7 +4019,7 @@ def render_live_month_panel():
     if not GSPREAD_AVAILABLE:
         return
 
-    with st.expander("\U0001F4E1 Live This Month (from connected Google Sheet)", expanded=False):
+    with st.expander("\U0001F4E1 Live This Month (from connected Google Sheet)", expanded=True):
         btn_col1, btn_col2 = st.columns(2)
         with btn_col1:
             if st.button("\U0001F504 Refresh live numbers", key="refresh_live_month", use_container_width=True):
@@ -5237,9 +5257,10 @@ def main():
         unsafe_allow_html=True,
     )
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         [
             "\U0001F4CA Operations Dashboard",
+            "\U0001F4E1 Live Tracker (Google Sheets)",
             "\U0001F4B0 Financial & Payroll",
             "\U0001F4E4 Upload Monthly Data",
             "\U0001F50D Rider Lookup",
@@ -5250,12 +5271,14 @@ def main():
     with tab1:
         render_dashboard(filters)
     with tab2:
-        render_financials(filters)
+        render_live_tracker_tab()
     with tab3:
-        render_upload_tab()
+        render_financials(filters)
     with tab4:
-        render_rider_lookup(filters)
+        render_upload_tab()
     with tab5:
+        render_rider_lookup(filters)
+    with tab6:
         render_supervisor_alerts()
 
 
