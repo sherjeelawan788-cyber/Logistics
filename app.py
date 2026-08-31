@@ -1771,16 +1771,23 @@ def render_dashboard(filters: dict):
     # days-worked count for the month to count as Valid. See
     # compute_performance_validity() -- thresholds are Admin-adjustable
     # under Global Filters -> Validity Targets in the sidebar.
+    #
+    # Scoped to roster_only (in_roster==1) -- the same 64-ish riders
+    # Headcount/Active/Terminated are scoped to -- NOT the full
+    # month_df, which can also contain placeholder/unmatched driver_ids
+    # that orders/validity/attendance sheets reference but that never
+    # made it onto the actual roster. Counting those inflates Valid +
+    # Invalid to add up to more than the real headcount.
     targets = _load_validity_targets()
-    month_df = month_df.copy()
-    month_df["performance_validity"] = month_df.apply(
+    roster_only = roster_only.copy()
+    roster_only["performance_validity"] = roster_only.apply(
         lambda r: compute_performance_validity(
             r["total_orders"], r["valid_days_in_month"], targets["min_orders"], targets["min_days"]
         ),
         axis=1,
     )
-    valid_drivers = (month_df["performance_validity"] == "Valid").sum()
-    invalid_drivers = (month_df["performance_validity"] == "Invalid").sum()
+    valid_drivers = (roster_only["performance_validity"] == "Valid").sum()
+    invalid_drivers = (roster_only["performance_validity"] == "Invalid").sum()
 
     st.markdown(f"**Selected Month:** `{month_display(filters['month'])}`")
     st.caption(
@@ -1794,8 +1801,8 @@ def render_dashboard(filters: dict):
     suspended_only = roster_only[roster_only["status"] == "Suspended"]
     company_car_only = roster_only_for_vehicle[roster_only_for_vehicle["vehicle_type"] == "Company Car"]
     own_car_only = roster_only_for_vehicle[roster_only_for_vehicle["vehicle_type"] == "Own Car"]
-    valid_only = month_df[month_df["performance_validity"] == "Valid"]
-    invalid_only = month_df[month_df["performance_validity"] == "Invalid"]
+    valid_only = roster_only[roster_only["performance_validity"] == "Valid"]
+    invalid_only = roster_only[roster_only["performance_validity"] == "Invalid"]
 
     roster_cols = ["driver_id", "driver_name", "supervisor_name", "status", "vehicle_type"]
     validity_cols = ["driver_id", "driver_name", "total_orders", "valid_days_in_month", "performance_validity"]
@@ -4063,12 +4070,17 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
     # validity sheet's own valid-day count when available, else the
     # attendance sheet's present-day count -- same fallback the real
     # Sync uses when writing valid_days_in_month.
+    #
+    # Scoped to roster_records ONLY -- the same riders "Riders on Sheet"
+    # counts -- NOT the wider union with orders/validity/attendance,
+    # which can include placeholder/unmatched IDs those sheets reference
+    # but that never made it onto the actual roster. Counting those
+    # inflates Valid + Invalid to add up to more than the roster count.
     targets = _load_validity_targets()
-    all_known_ids = set(roster_records) | set(orders_by_id) | set(validity_by_id) | set(attendance_by_id)
     valid_count = 0
     invalid_count = 0
     performance_validity_by_id = {}
-    for did in all_known_ids:
+    for did in roster_records:
         days_worked = validity_by_id[did]["valid_days"] if did in validity_by_id else attendance_by_id.get(did, 0)
         status = compute_performance_validity(orders_by_id.get(did, 0), days_worked, targets["min_orders"], targets["min_days"])
         performance_validity_by_id[did] = status
