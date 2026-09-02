@@ -58,6 +58,9 @@ OWNER_CONFIG_PATH = "hq_owner.json"
 VALIDITY_TARGETS_PATH = "hq_validity_targets.json"
 DEFAULT_MIN_ORDERS_FOR_VALID = 330
 DEFAULT_MIN_DAYS_FOR_VALID = 26
+DEFAULT_MID_MONTH_CUTOFF_DAY = 15
+DEFAULT_MID_MONTH_MIN_ORDERS = 160
+DEFAULT_MID_MONTH_MIN_DAYS = 14
 
 DRIVER_STATUSES = ["Active", "Terminated", "Suspended"]
 VEHICLE_TYPES = ["Company Car", "Own Car"]
@@ -1361,22 +1364,37 @@ def clear_all_data() -> None:
 
 
 def _load_validity_targets() -> dict:
+    defaults = {
+        "min_orders": DEFAULT_MIN_ORDERS_FOR_VALID,
+        "min_days": DEFAULT_MIN_DAYS_FOR_VALID,
+        "mid_month_cutoff_day": DEFAULT_MID_MONTH_CUTOFF_DAY,
+        "mid_month_min_orders": DEFAULT_MID_MONTH_MIN_ORDERS,
+        "mid_month_min_days": DEFAULT_MID_MONTH_MIN_DAYS,
+    }
     if not os.path.exists(VALIDITY_TARGETS_PATH):
-        return {"min_orders": DEFAULT_MIN_ORDERS_FOR_VALID, "min_days": DEFAULT_MIN_DAYS_FOR_VALID}
+        return defaults
     try:
         with open(VALIDITY_TARGETS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return {
-            "min_orders": int(data.get("min_orders", DEFAULT_MIN_ORDERS_FOR_VALID)),
-            "min_days": int(data.get("min_days", DEFAULT_MIN_DAYS_FOR_VALID)),
-        }
+        return {key: int(data.get(key, default)) for key, default in defaults.items()}
     except Exception:  # noqa: BLE001
-        return {"min_orders": DEFAULT_MIN_ORDERS_FOR_VALID, "min_days": DEFAULT_MIN_DAYS_FOR_VALID}
+        return defaults
 
 
-def _save_validity_targets(min_orders: int, min_days: int) -> None:
+def _save_validity_targets(
+    min_orders: int, min_days: int,
+    mid_month_cutoff_day: int = DEFAULT_MID_MONTH_CUTOFF_DAY,
+    mid_month_min_orders: int = DEFAULT_MID_MONTH_MIN_ORDERS,
+    mid_month_min_days: int = DEFAULT_MID_MONTH_MIN_DAYS,
+) -> None:
     with open(VALIDITY_TARGETS_PATH, "w", encoding="utf-8") as f:
-        json.dump({"min_orders": int(min_orders), "min_days": int(min_days)}, f)
+        json.dump({
+            "min_orders": int(min_orders),
+            "min_days": int(min_days),
+            "mid_month_cutoff_day": int(mid_month_cutoff_day),
+            "mid_month_min_orders": int(mid_month_min_orders),
+            "mid_month_min_days": int(mid_month_min_days),
+        }, f)
 
 
 def compute_performance_validity(total_orders, days_worked, min_orders: int, min_days: int) -> str:
@@ -1389,6 +1407,27 @@ def compute_performance_validity(total_orders, days_worked, min_orders: int, min
     if orders < min_orders or days < min_days:
         return "Invalid"
     return "Valid"
+
+
+def compute_performance_validity_for_rider(total_orders, days_worked, join_date, month_year: str, targets: dict) -> str:
+    """Same whole-month check as compute_performance_validity(), except
+    a rider who joined PARTWAY THROUGH this same month -- after the
+    Admin-configured cutoff day -- is judged against the reduced
+    mid-month target instead of the full-month one, since they
+    physically couldn't have worked a full month. A rider who joined
+    in an earlier month (or on/before the cutoff day this month) is
+    judged against the normal full-month target as usual."""
+    min_orders = targets["min_orders"]
+    min_days = targets["min_days"]
+    if join_date:
+        try:
+            jd = datetime.strptime(str(join_date), "%Y-%m-%d")
+            if jd.strftime("%Y-%m") == month_year and jd.day > targets["mid_month_cutoff_day"]:
+                min_orders = targets["mid_month_min_orders"]
+                min_days = targets["mid_month_min_days"]
+        except (ValueError, TypeError):
+            pass
+    return compute_performance_validity(total_orders, days_worked, min_orders, min_days)
 
 
 # ==============================================================================
@@ -1647,8 +1686,29 @@ def render_sidebar():
                 "Minimum days worked this month", min_value=0, max_value=31, value=targets["min_days"], step=1,
                 key="validity_target_days",
             )
+            st.markdown("---")
+            st.caption(
+                "\U0001F195 **Mid-month joiners** -- a rider who joined partway through "
+                "the month (after the cutoff day below) is judged against a reduced "
+                "target instead, since they couldn't have worked a full month."
+            )
+            new_cutoff_day = st.number_input(
+                "Joined after this day of the month \u2192 counts as mid-month",
+                min_value=1, max_value=31, value=targets["mid_month_cutoff_day"], step=1,
+                key="validity_target_cutoff_day",
+            )
+            new_mid_orders = st.number_input(
+                "Reduced minimum orders (mid-month joiners)", min_value=0,
+                value=targets["mid_month_min_orders"], step=10,
+                key="validity_target_mid_orders",
+            )
+            new_mid_days = st.number_input(
+                "Reduced minimum days worked (mid-month joiners)", min_value=0, max_value=31,
+                value=targets["mid_month_min_days"], step=1,
+                key="validity_target_mid_days",
+            )
             if st.button("\U0001F4BE Save Targets", use_container_width=True):
-                _save_validity_targets(new_min_orders, new_min_days)
+                _save_validity_targets(new_min_orders, new_min_days, new_cutoff_day, new_mid_orders, new_mid_days)
                 st.success("Saved.")
                 st.rerun()
 
@@ -1781,8 +1841,8 @@ def render_dashboard(filters: dict):
     targets = _load_validity_targets()
     roster_only = roster_only.copy()
     roster_only["performance_validity"] = roster_only.apply(
-        lambda r: compute_performance_validity(
-            r["total_orders"], r["valid_days_in_month"], targets["min_orders"], targets["min_days"]
+        lambda r: compute_performance_validity_for_rider(
+            r["total_orders"], r["valid_days_in_month"], r["join_date"], filters["month"], targets
         ),
         axis=1,
     )
@@ -4077,12 +4137,15 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
     # but that never made it onto the actual roster. Counting those
     # inflates Valid + Invalid to add up to more than the roster count.
     targets = _load_validity_targets()
+    current_month = datetime.today().strftime("%Y-%m")
     valid_count = 0
     invalid_count = 0
     performance_validity_by_id = {}
     for did in roster_records:
         days_worked = validity_by_id[did]["valid_days"] if did in validity_by_id else attendance_by_id.get(did, 0)
-        status = compute_performance_validity(orders_by_id.get(did, 0), days_worked, targets["min_orders"], targets["min_days"])
+        status = compute_performance_validity_for_rider(
+            orders_by_id.get(did, 0), days_worked, roster_records[did].get("join_date"), current_month, targets
+        )
         performance_validity_by_id[did] = status
         if status == "Valid":
             valid_count += 1
@@ -4208,6 +4271,16 @@ def render_live_month_panel():
         return
 
     with st.expander("\U0001F4E1 Live This Month (from connected Google Sheet)", expanded=True):
+        save_month = st.text_input(
+            "Which month is this Sheet data for? (YYYY-MM)",
+            value=datetime.today().strftime("%Y-%m"),
+            key="live_panel_save_month",
+            help=(
+                "Defaults to today's calendar month -- change this if you're catching up "
+                "on an earlier month whose data is still sitting in the Sheet (e.g. it's "
+                "now September but this data is really August's)."
+            ),
+        )
         btn_col1, btn_col2 = st.columns(2)
         with btn_col1:
             if st.button("\U0001F504 Refresh live numbers", key="refresh_live_month", use_container_width=True):
@@ -4216,7 +4289,7 @@ def render_live_month_panel():
             save_now = st.button(
                 "\U0001F4BE Save This Month to History Now", key="live_panel_save_now",
                 type="primary", use_container_width=True,
-                help="Saves exactly what's shown below into permanent history for this month -- same as Sync Now.",
+                help="Saves exactly what's shown below into permanent history for the month typed above.",
             )
 
         if "live_month_cache" not in st.session_state:
@@ -4228,7 +4301,7 @@ def render_live_month_panel():
                 return
 
         if save_now:
-            current_month = datetime.today().strftime("%Y-%m")
+            current_month = save_month.strip() or datetime.today().strftime("%Y-%m")
             try:
                 with st.spinner(f"Saving {month_display(current_month)} into history..."):
                     summary = sync_month_from_gsheet(config["sheet_id"], current_month, roster_tab_override=config.get("roster_tab_override"))
@@ -4239,10 +4312,15 @@ def render_live_month_panel():
                     f"Saved {month_display(current_month)} -- {summary['roster_count']} roster "
                     f"record(s), {summary['logs_written']} monthly log row(s) written."
                 )
-                _update_gsheet_config(
-                    last_auto_sync_date=datetime.today().strftime("%Y-%m-%d"),
-                    last_synced_month=current_month,
-                )
+                # Only update the auto-sync bookkeeping when this really
+                # was today's calendar month -- saving an OLDER catch-up
+                # month here shouldn't make auto-sync think that older
+                # month is now "current" and stop tracking today's.
+                if current_month == datetime.today().strftime("%Y-%m"):
+                    _update_gsheet_config(
+                        last_auto_sync_date=datetime.today().strftime("%Y-%m-%d"),
+                        last_synced_month=current_month,
+                    )
                 st.session_state.pop("live_month_cache", None)
                 st.rerun()
 
@@ -4574,6 +4652,14 @@ token_uri = "https://oauth2.googleapis.com/token"
         "enough. The moment the calendar rolls into a new month, it also "
         "does one FINAL sync of the month that just ended first, so nothing "
         "entered on the last day gets missed. No button-clicking needed."
+    )
+    st.caption(
+        "\u26A0\uFE0F This assumes the Sheet's data matches today's calendar month. If "
+        "you ever fall behind -- e.g. it's already September but August's data is "
+        "still sitting in the Sheet, not yet cleared for September -- auto-sync "
+        "will save it AS September. Catch up manually first (Live Tracker's "
+        "editable month field, or Sync a Month into History below) before opening "
+        "the dashboard lets auto-sync run, or turn this off until you're caught up."
     )
     auto_sync_on = st.checkbox(
         "\U0001F501 Auto-save automatically when I open the dashboard",
