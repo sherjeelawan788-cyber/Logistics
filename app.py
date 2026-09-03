@@ -3875,6 +3875,41 @@ def _get_gspread_client():
     return gspread.authorize(creds)
 
 
+def _explain_gsheet_error(exc: Exception) -> str:
+    """gspread/Google API exceptions are often unhelpfully terse -- some
+    (like SpreadsheetNotFound) stringify to nothing at all, which is
+    why 'Couldn't connect: ' used to show up with no detail after the
+    colon. Turn the common, actionable cases into a message that tells
+    the Admin exactly what to check instead."""
+    if GSPREAD_AVAILABLE:
+        if isinstance(exc, gspread.exceptions.SpreadsheetNotFound):
+            return (
+                "Sheet not found. Either the Sheet ID/URL is wrong, or this "
+                "exact Sheet hasn't been shared with the service account's "
+                "email yet -- this has to be done again for EVERY new Sheet "
+                "you connect, even if you already shared a different one "
+                "before. Open this Sheet -> Share -> paste the client_email "
+                "from your credentials -> Viewer access."
+            )
+        if isinstance(exc, gspread.exceptions.APIError):
+            message = str(exc)
+            try:
+                detail = exc.response.json().get("error", {})
+                if detail.get("message"):
+                    message = detail["message"]
+            except Exception:  # noqa: BLE001
+                pass
+            if "PERMISSION_DENIED" in str(exc) or "does not have permission" in message.lower():
+                return (
+                    "Permission denied. This Sheet hasn't been shared with the "
+                    "service account's email yet -- open this Sheet -> Share -> "
+                    "paste the client_email from your credentials -> Viewer access."
+                )
+            return f"Google API error: {message}"
+    text = str(exc).strip()
+    return text if text else f"{type(exc).__name__} (Google gave no further detail -- see the tips above about sharing the Sheet)."
+
+
 def _dedupe_headers(header: list) -> list:
     """Mimic what pandas.read_excel() already does automatically for a
     duplicated column name -- rename the 2nd, 3rd, etc. occurrence to
@@ -4297,7 +4332,7 @@ def render_live_month_panel():
                 with st.spinner("Reading every tab of the Google Sheet..."):
                     st.session_state["live_month_cache"] = fetch_live_month_to_date(config["sheet_id"], roster_tab_override=config.get("roster_tab_override"))
             except Exception as exc:  # noqa: BLE001
-                st.warning(f"Couldn't read the Google Sheet right now: {exc}")
+                st.warning(f"Couldn't read the Google Sheet right now: {_explain_gsheet_error(exc)}")
                 return
 
         if save_now:
@@ -4306,7 +4341,7 @@ def render_live_month_panel():
                 with st.spinner(f"Saving {month_display(current_month)} into history..."):
                     summary = sync_month_from_gsheet(config["sheet_id"], current_month, roster_tab_override=config.get("roster_tab_override"))
             except Exception as exc:  # noqa: BLE001
-                st.error(f"Save failed: {exc}")
+                st.error(f"Save failed: {_explain_gsheet_error(exc)}")
             else:
                 st.success(
                     f"Saved {month_display(current_month)} -- {summary['roster_count']} roster "
@@ -4554,7 +4589,7 @@ token_uri = "https://oauth2.googleapis.com/token"
                 frames = fetch_gsheet_frames(config["sheet_id"])
             st.success(f"Connected successfully -- found {len(frames)} tab(s): " + ", ".join(n for n, _ in frames))
         except Exception as exc:  # noqa: BLE001
-            st.error(f"Couldn't connect: {exc}")
+            st.error(f"Couldn't connect: {_explain_gsheet_error(exc)}")
 
     st.markdown("---")
     st.markdown("#### \U0001F3AF Roster Tab Override")
@@ -4620,7 +4655,7 @@ token_uri = "https://oauth2.googleapis.com/token"
                 with st.spinner("Reading the Google Sheet and importing..."):
                     summary = sync_month_from_gsheet(config["sheet_id"], sync_month.strip(), roster_tab_override=config.get("roster_tab_override"))
             except Exception as exc:  # noqa: BLE001
-                st.error(f"Sync failed: {exc}")
+                st.error(f"Sync failed: {_explain_gsheet_error(exc)}")
             else:
                 st.success(
                     f"Imported {summary['roster_count']} roster record(s) and wrote "
