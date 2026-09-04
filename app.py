@@ -4042,6 +4042,8 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
     override_key = roster_tab_override.strip().lower() if roster_tab_override else None
     orders_sheet_columns = {}  # {sheet_name: [columns]} -- for the "why is orders wrong" diagnostic
     orders_sheet_diagnostics = {}  # {sheet_name: {...}} -- explicit-column vs day-sum comparison
+    all_tab_columns = {}  # {sheet_name: [columns]} -- EVERY tab, regardless of classification --
+    #                        lets the Admin inspect why an "unrecognized" tab wasn't picked up.
 
     for sheet_name, df in frames:
         df = df.dropna(axis=0, how="all").reset_index(drop=True)
@@ -4049,6 +4051,7 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
             sheet_report.append((sheet_name, "empty", 0))
             continue
         df.columns = _dedupe_headers([str(c).strip() for c in df.columns])
+        all_tab_columns[sheet_name] = list(df.columns)
         if override_key and sheet_name.strip().lower() == override_key:
             override_df = df
             override_matched_name = sheet_name
@@ -4230,6 +4233,7 @@ def fetch_live_month_to_date(sheet_id: str, roster_tab_override: str = None) -> 
         "roster_orders_sum": roster_orders_sum,
         "roster_sheet_columns": roster_sheet_columns,
         "orders_sheet_columns": orders_sheet_columns,
+        "all_tab_columns": all_tab_columns,
         "orders_sheet_diagnostics": orders_sheet_diagnostics,
         "duplicate_orders_sheets": duplicate_orders_sheets,
         "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -4501,6 +4505,20 @@ def render_live_month_panel():
 
             report_df = pd.DataFrame(live["sheet_report"], columns=["Tab", "Detected as", "Rows"])
             st.dataframe(report_df, use_container_width=True, hide_index=True)
+
+            if live.get("all_tab_columns"):
+                st.markdown("---")
+                st.markdown("##### \U0001F50D Inspect any tab's columns")
+                st.caption(
+                    "Pick a tab (especially one marked 'unrecognized') to see exactly which "
+                    "column headers Streamlit actually read from it -- if the real headers "
+                    "('Courier ID', 'TOTAL ORDERS', etc.) aren't in this list, the wrong row "
+                    "is being read as the header (often a blank/title row above the real one)."
+                )
+                inspect_tab = st.selectbox(
+                    "Tab to inspect", list(live["all_tab_columns"].keys()), key="inspect_tab_columns",
+                )
+                st.code(" | ".join(str(c) for c in live["all_tab_columns"][inspect_tab]), language=None)
 
 
 def render_gsheet_sync_tab():
