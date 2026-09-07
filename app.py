@@ -2962,22 +2962,41 @@ def _classify_sheet(df: pd.DataFrame) -> str:
 
     day_cols = _day_number_columns(cols)
     if len(day_cols) >= 15:
-        sample = set()
-        numeric_hits, checked = 0, 0
-        for c in day_cols[:8]:
-            vals = df[c].dropna().astype(str).str.strip()
-            for v in vals.head(25):
-                checked += 1
-                vu = v.upper()
-                sample.add(vu)
-                if re.match(r"^-?\d+(\.\d+)?$", v):
-                    numeric_hits += 1
+        def _sample_day_cols(candidate_cols):
+            sample_set = set()
+            hits, total = 0, 0
+            for c in candidate_cols:
+                vals = df[c].dropna().astype(str).str.strip()
+                vals = vals[vals != ""]
+                for v in vals.head(25):
+                    total += 1
+                    vu = v.upper()
+                    sample_set.add(vu)
+                    if re.match(r"^-?\d+(\.\d+)?$", v):
+                        hits += 1
+            return sample_set, hits, total
+
+        sample, numeric_hits, checked = _sample_day_cols(day_cols[:8])
+        if checked == 0:
+            # Early in the month, the first several day-columns can be
+            # entirely blank (nothing entered yet for those dates) even
+            # though later days already have data -- widen the sample
+            # to every day-column instead of giving up after just the
+            # first 8.
+            sample, numeric_hits, checked = _sample_day_cols(day_cols)
+
         if sample & VALIDITY_TOKENS:
             return "validity"
         if numeric_hits and checked and (numeric_hits / checked) >= 0.4:
             return "orders"
         if sample & ATTENDANCE_TOKENS:
             return "attendance"
+        # Still inconclusive (e.g. this whole month's day-by-day cells
+        # are empty so far, very early in the month) -- fall back to an
+        # explicit Total Orders-style column if this sheet has one,
+        # rather than giving up and marking the whole tab unrecognized.
+        if _guess_column(cols, FIELD_ALIASES["total_orders"]) != NONE_OPTION:
+            return "orders"
         return "unrecognized"
 
     if _guess_column(cols, FIELD_ALIASES["total_orders"]) != NONE_OPTION:
@@ -3480,12 +3499,21 @@ def _score_roster_candidate(sheet_name: str, df: pd.DataFrame) -> float:
     return valid_ids - unnamed_penalty + name_bonus
 
 
-def process_workbook_all_sheets(uploaded_file, month_year: str):
+def process_workbook_all_sheets(uploaded_file, month_year: str, roster_tab_override: str = None):
     """Read every sheet of an uploaded Excel workbook and hand them off
     to _process_sheet_frames(), which contains the actual classify/
     extract/merge logic. Kept separate so the exact same logic can be
     reused for a Google Sheet (see process_workbook_from_gsheet below)
-    without re-reading through pandas.ExcelFile at all."""
+    without re-reading through pandas.ExcelFile at all.
+
+    roster_tab_override: same setting as the Google Sheet Sync tab's
+    "Roster Tab Override" -- when the caller doesn't pass one
+    explicitly, this defaults to reading that same saved setting, so a
+    workbook with more than one roster-shaped tab (e.g. 'Main Data' vs
+    'Registered ID') picks the same tab an Admin already confirmed is
+    correct, whether the data came from Excel or Google Sheets."""
+    if roster_tab_override is None:
+        roster_tab_override = (_load_gsheet_config() or {}).get("roster_tab_override")
     xls = pd.ExcelFile(uploaded_file)
     sheet_frames = []
     sheet_read_errors = []
@@ -3495,7 +3523,7 @@ def process_workbook_all_sheets(uploaded_file, month_year: str):
             sheet_frames.append((sheet_name, df))
         except Exception as exc:  # noqa: BLE001
             sheet_read_errors.append((sheet_name, f"error reading sheet: {exc}"))
-    return _process_sheet_frames(sheet_frames, month_year, sheet_read_errors)
+    return _process_sheet_frames(sheet_frames, month_year, sheet_read_errors, roster_tab_override=roster_tab_override)
 
 
 def _process_sheet_frames(sheet_frames: list, month_year: str, sheet_read_errors: list = None, roster_tab_override: str = None) -> dict:
@@ -4818,7 +4846,15 @@ def _render_operations_upload():
                 "'ON VOCATION') are also recognized -- every rider listed under one is "
                 "tagged with that status automatically."
             )
-            inferred_month = _infer_month_from_filename(uploaded_file.name) or datetime.today().strftime("%Y-%m")
+            filename_month = _infer_month_from_filename(uploaded_file.name)
+            inferred_month = filename_month or datetime.today().strftime("%Y-%m")
+            if not filename_month:
+                st.warning(
+                    "\u26A0\uFE0F **Couldn't tell which month this file is for from its "
+                    "filename -- defaulted to today's calendar month below. Double-check "
+                    "it before importing**, especially if you're catching up on an earlier "
+                    "month (e.g. it's already September but this file is really August's)."
+                )
             month_year = st.text_input(
                 "Which month does this whole file cover? (YYYY-MM)",
                 value=inferred_month,
@@ -4927,7 +4963,14 @@ def _render_salary_upload():
     if salary_file is None:
         return
 
-    inferred_month = _infer_month_from_filename(salary_file.name) or datetime.today().strftime("%Y-%m")
+    filename_month = _infer_month_from_filename(salary_file.name)
+    inferred_month = filename_month or datetime.today().strftime("%Y-%m")
+    if not filename_month:
+        st.warning(
+            "\u26A0\uFE0F **Couldn't tell which month this file is for from its filename -- "
+            "defaulted to today's calendar month below. Double-check it before "
+            "importing**, especially if you're catching up on an earlier month."
+        )
     salary_month = st.text_input(
         "Which month does this file cover, if a sheet doesn't already say? (YYYY-MM)",
         value=inferred_month,
