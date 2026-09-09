@@ -3523,6 +3523,11 @@ def process_workbook_all_sheets(uploaded_file, month_year: str, roster_tab_overr
             sheet_frames.append((sheet_name, df))
         except Exception as exc:  # noqa: BLE001
             sheet_read_errors.append((sheet_name, f"error reading sheet: {exc}"))
+    # Same "Tabs to Ignore" setting the Google Sheet Sync tab uses --
+    # applies here too, so a tab like 'PT ORDERS REPORT' stays excluded
+    # from Excel uploads exactly like it is from a Google Sheet sync.
+    ignored_tabs = (_load_gsheet_config() or {}).get("ignored_tabs")
+    sheet_frames = _filter_ignored_tabs(sheet_frames, ignored_tabs)
     return _process_sheet_frames(sheet_frames, month_year, sheet_read_errors, roster_tab_override=roster_tab_override)
 
 
