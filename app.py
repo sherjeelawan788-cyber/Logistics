@@ -30,6 +30,7 @@ import json
 import os
 import random
 import re
+import urllib.parse
 import smtplib
 import sqlite3
 from datetime import datetime, timedelta
@@ -1126,6 +1127,7 @@ def init_db() -> None:
 
     _add_column_if_missing(conn, "drivers", "iqama_number TEXT")
     _add_column_if_missing(conn, "drivers", "sponsor_name TEXT")
+    _add_column_if_missing(conn, "drivers", "off_days TEXT")
     _add_column_if_missing(conn, "monthly_logs", "cancelled_orders INTEGER NOT NULL DEFAULT 0")
     _add_column_if_missing(conn, "monthly_logs", "pending_salary REAL NOT NULL DEFAULT 0")
     _add_column_if_missing(conn, "monthly_logs", "in_roster INTEGER NOT NULL DEFAULT 0")
@@ -1167,6 +1169,14 @@ def upsert_driver(conn: sqlite3.Connection, row: dict) -> None:
             row.get("termination_date"), row.get("iqama_number"), row.get("sponsor_name"),
         ),
     )
+
+
+def update_driver_off_days(conn: sqlite3.Connection, driver_id: str, off_days: str) -> None:
+    """Sets a rider's weekly off-days (e.g. 'Monday, Thursday') --
+    kept separate from upsert_driver since off-days come from their
+    own dedicated Weekly Schedule upload, not the monthly roster sync,
+    and shouldn't require re-uploading the whole roster to change."""
+    conn.execute("UPDATE drivers SET off_days = ? WHERE driver_id = ?", (off_days, driver_id))
 
 
 def upsert_monthly_log(conn: sqlite3.Connection, row: dict) -> None:
@@ -2092,6 +2102,7 @@ FIELD_ALIASES = {
     "net_salary": ["net salary", "net pay", "net"],
     "validity_status": ["validity", "validity status"],
     "valid_days_in_month": ["valid days", "days valid", "valid days in month", "attendance"],
+    "off_days": ["off day", "off days", "weekly off", "rest day", "rest days", "day off", "days off", "off day(s)"],
 }
 
 FIELD_LABELS = {
@@ -3255,6 +3266,204 @@ def _extract_roster(df: pd.DataFrame, month_year: str = None) -> dict:
             ),
         }
     return records
+
+
+# ==============================================================================
+# WEEKLY OFF-DAYS  -- a dedicated small upload (Driver ID + which day(s)
+# they're off each week), used to send each rider their schedule via a
+# one-click WhatsApp link -- see the "Weekly Schedule" upload tab and
+# render_whatsapp_schedule_tab().
+# ==============================================================================
+
+_WEEKDAY_ORDER = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
+_WEEKDAY_PATTERNS = {
+    "MONDAY": ["MONDAY", "MON"],
+    "TUESDAY": ["TUESDAY", "TUES", "TUE"],
+    "WEDNESDAY": ["WEDNESDAY", "WED"],
+    "THURSDAY": ["THURSDAY", "THURS", "THUR", "THU"],
+    "FRIDAY": ["FRIDAY", "FRI"],
+    "SATURDAY": ["SATURDAY", "SAT"],
+    "SUNDAY": ["SUNDAY", "SUN"],
+}
+
+
+def _normalize_off_days_text(raw) -> str:
+    """Turn free-text like 'Mon, Thu' / 'Monday and Thursday' / 'MON/THU'
+    into a clean, consistent 'Monday, Thursday' string -- robust to
+    whatever separator or day-abbreviation style a sheet happens to
+    use. Always returned in calendar order (Mon..Sun), regardless of
+    the order they appeared in the original text."""
+    if pd.isna(raw):
+        return ""
+    s = str(raw).strip().upper()
+    if not s:
+        return ""
+    found = set()
+    for canonical, variants in _WEEKDAY_PATTERNS.items():
+        for variant in variants:
+            if re.search(rf"\b{variant}\b", s):
+                found.add(canonical)
+                break
+    return ", ".join(d.capitalize() for d in _WEEKDAY_ORDER if d in found)
+
+
+def _extract_off_days(df: pd.DataFrame):
+    """driver_id -> 'Monday, Thursday'-style off-days string, plus a
+    name lookup for fuzzy ID matching -- same pattern as every other
+    sheet-extraction function in this file."""
+    cols = list(df.columns)
+    id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
+    name_col = _guess_column(cols, FIELD_ALIASES["driver_name"])
+    off_col = _guess_column(cols, FIELD_ALIASES["off_days"])
+    if id_col == NONE_OPTION or off_col == NONE_OPTION:
+        return {}, {}
+    out = {}
+    id_to_name = {}
+    for _, raw in df.iterrows():
+        if _row_is_summary(raw):
+            continue
+        driver_id = _clean_id_value(raw[id_col])
+        if not driver_id:
+            continue
+        off_days = _normalize_off_days_text(raw[off_col])
+        if off_days:
+            out[driver_id] = off_days
+        if name_col != NONE_OPTION and not pd.isna(raw[name_col]):
+            nm = str(raw[name_col]).strip()
+            if nm:
+                id_to_name[driver_id] = nm
+    return out, id_to_name
+
+
+def process_off_days_workbook(uploaded_file) -> dict:
+    """Reads every sheet of the uploaded off-days file, extracts
+    Driver ID -> off-days from whichever sheet(s) have a recognizable
+    off-days column, and saves it onto each matched rider's profile.
+    Unmatched names (no existing driver with that ID) are skipped and
+    reported, rather than creating placeholder profiles -- off-days
+    only make sense for a rider who already exists."""
+    xls = pd.ExcelFile(uploaded_file) if str(getattr(uploaded_file, "name", "")).lower().endswith((".xlsx", ".xls")) else None
+
+    off_days_by_id = {}
+    id_to_name = {}
+    sheet_report = []
+
+    if xls is not None:
+        for sheet_name in xls.sheet_names:
+            try:
+                df, _hdr = _read_excel_smart(uploaded_file, sheet_name)
+            except Exception as exc:  # noqa: BLE001
+                sheet_report.append((sheet_name, f"error reading sheet: {exc}", 0))
+                continue
+            df = df.dropna(axis=0, how="all").reset_index(drop=True)
+            df.columns = _dedupe_headers([str(c).strip() for c in df.columns])
+            if df.empty:
+                sheet_report.append((sheet_name, "empty", 0))
+                continue
+            extracted, names = _extract_off_days(df)
+            if extracted:
+                sheet_report.append((sheet_name, "off-days", len(extracted)))
+                off_days_by_id.update(extracted)
+                id_to_name.update(names)
+            else:
+                sheet_report.append((sheet_name, "unrecognized", len(df)))
+    else:
+        uploaded_file.seek(0)
+        df = pd.read_csv(uploaded_file)
+        df.columns = _dedupe_headers([str(c).strip() for c in df.columns])
+        extracted, names = _extract_off_days(df)
+        off_days_by_id.update(extracted)
+        id_to_name.update(names)
+        sheet_report.append(("(CSV)", "off-days" if extracted else "unrecognized", len(df)))
+
+    all_drivers_df = load_drivers()
+    known_driver_ids = set(all_drivers_df["driver_id"])
+    name_to_id = dict(zip(all_drivers_df["driver_name"].str.strip().str.upper(), all_drivers_df["driver_id"]))
+    # Off-days are text, not summable numbers -- _remap_ids_by_name()
+    # assumes numeric values it can add together for duplicate keys, so
+    # a lighter remap is used here instead: just retarget the ID, last
+    # value wins for any collision (there shouldn't normally be one).
+    remapped_off_days = {}
+    for key, value in off_days_by_id.items():
+        target = key
+        if key not in known_driver_ids:
+            name = id_to_name.get(key)
+            if name:
+                matched = _fuzzy_match_name_to_id(name_to_id, name)
+                if matched:
+                    target = matched
+        remapped_off_days[target] = value
+    off_days_by_id = remapped_off_days
+
+    conn = get_connection()
+    matched = 0
+    unmatched = []
+    for driver_id, off_days in off_days_by_id.items():
+        if driver_id in known_driver_ids:
+            update_driver_off_days(conn, driver_id, off_days)
+            matched += 1
+        else:
+            unmatched.append(id_to_name.get(driver_id, driver_id))
+    conn.commit()
+    conn.close()
+
+    return {"matched": matched, "unmatched": unmatched, "sheet_report": sheet_report}
+
+
+def _clean_whatsapp_number(phone: str, default_country_code: str) -> str:
+    """Turns a locally-formatted phone number ('0300 1234567', '03001234567')
+    into the digits-only, country-code-prefixed form wa.me links need
+    ('923001234567'). If the number already looks like it has a country
+    code (11+ digits with no leading 0), it's left alone."""
+    if not phone:
+        return ""
+    digits = re.sub(r"\D", "", str(phone))
+    if not digits:
+        return ""
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("0"):
+        digits = default_country_code.lstrip("+") + digits[1:]
+    elif len(digits) <= 10:
+        digits = default_country_code.lstrip("+") + digits
+    return digits
+
+
+def build_whatsapp_link(phone: str, message: str, default_country_code: str) -> str:
+    """A wa.me link that opens WhatsApp with `message` pre-filled for
+    `phone` -- clicking it is a one-tap 'ready to send', not a fully
+    automatic send (that needs the paid WhatsApp Business API)."""
+    number = _clean_whatsapp_number(phone, default_country_code)
+    if not number:
+        return ""
+    return f"https://wa.me/{number}?text={urllib.parse.quote(message)}"
+
+
+WHATSAPP_CONFIG_PATH = "hq_whatsapp_config.json"
+DEFAULT_WHATSAPP_COUNTRY_CODE = "92"
+DEFAULT_OFF_DAYS_MESSAGE_TEMPLATE = (
+    "Hi {name}, your weekly off day(s) this week: {off_days}. - Tamkeen Management"
+)
+
+
+def _load_whatsapp_config() -> dict:
+    defaults = {
+        "country_code": DEFAULT_WHATSAPP_COUNTRY_CODE,
+        "message_template": DEFAULT_OFF_DAYS_MESSAGE_TEMPLATE,
+    }
+    if not os.path.exists(WHATSAPP_CONFIG_PATH):
+        return defaults
+    try:
+        with open(WHATSAPP_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {key: data.get(key, default) for key, default in defaults.items()}
+    except Exception:  # noqa: BLE001
+        return defaults
+
+
+def _save_whatsapp_config(country_code: str, message_template: str) -> None:
+    with open(WHATSAPP_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump({"country_code": country_code, "message_template": message_template}, f)
 
 
 def _extract_orders(df: pd.DataFrame):
@@ -4802,8 +5011,8 @@ def render_upload_tab():
         )
         return
 
-    tab_ops, tab_salary, tab_gsheet = st.tabs(
-        ["\U0001F4E4 Roster / Orders / Validity", "\U0001F4B0 Salary Data", "\U0001F517 Google Sheet Sync"]
+    tab_ops, tab_salary, tab_gsheet, tab_offdays = st.tabs(
+        ["\U0001F4E4 Roster / Orders / Validity", "\U0001F4B0 Salary Data", "\U0001F517 Google Sheet Sync", "\U0001F4C5 Weekly Off-Days"]
     )
     with tab_ops:
         _render_operations_upload()
@@ -4811,6 +5020,8 @@ def render_upload_tab():
         _render_salary_upload()
     with tab_gsheet:
         render_gsheet_sync_tab()
+    with tab_offdays:
+        _render_off_days_upload()
 
 
 def _render_operations_upload():
@@ -5025,6 +5236,47 @@ def _render_salary_upload():
             )
             st.dataframe(report_df, use_container_width=True, hide_index=True)
             st.rerun()
+
+
+def _render_off_days_upload():
+    st.subheader("\U0001F4C5 Upload Weekly Off-Days")
+    st.write(
+        "One row per rider, with a column listing their weekly off day(s) -- "
+        "'Monday, Thursday', 'Mon/Thu', 'Friday', however your sheet writes it, "
+        "it's understood the same way. This is what powers the one-click "
+        "WhatsApp messages on the **Rider Lookup** and **Weekly Schedule** tabs. "
+        "Off-days aren't month-specific -- uploading again just updates whoever "
+        "changed."
+    )
+    st.caption(
+        "Column headers recognized: an ID column ('Courier ID', 'Driver ID', "
+        "etc.), optionally a Name column, and an off-days column (header "
+        "containing 'off day', 'weekly off', 'rest day', or similar)."
+    )
+
+    off_days_file = st.file_uploader(
+        "Choose the off-days file (Excel or CSV)", type=["xlsx", "xls", "csv"], key="off_days_uploader",
+    )
+    if off_days_file is None:
+        return
+
+    if st.button("\U0001F4C5 Import Off-Days", type="primary"):
+        with st.spinner("Reading and matching off-days..."):
+            result = process_off_days_workbook(off_days_file)
+
+        st.success(f"Updated off-days for {result['matched']} rider(s).")
+        if result["unmatched"]:
+            st.warning(
+                f"\u26A0\uFE0F {len(result['unmatched'])} name(s) in this file couldn't be "
+                f"matched to an existing rider (by ID or name), so nothing was saved "
+                f"for them -- off-days only apply to riders already on your roster: "
+                + ", ".join(str(n) for n in result["unmatched"][:15])
+                + (", ..." if len(result["unmatched"]) > 15 else "")
+            )
+
+        st.markdown("##### What each sheet was used for")
+        report_df = pd.DataFrame(result["sheet_report"], columns=["Sheet", "Detected as", "Rows"])
+        st.dataframe(report_df, use_container_width=True, hide_index=True)
 
 
 def _render_single_sheet_upload(uploaded_file, sheet_name):
@@ -5389,6 +5641,22 @@ def render_rider_lookup(filters: dict):
         unsafe_allow_html=True,
     )
 
+    off_days = profile.get("off_days") or ""
+    wa_col1, wa_col2 = st.columns([3, 1])
+    with wa_col1:
+        st.caption(f"\U0001F4C5 Weekly off day(s): **{off_days or 'Not set'}**")
+    with wa_col2:
+        if off_days and profile.get("phone"):
+            wa_config = _load_whatsapp_config()
+            message = wa_config["message_template"].format(name=profile["driver_name"], off_days=off_days)
+            link = build_whatsapp_link(profile["phone"], message, wa_config["country_code"])
+            if link:
+                st.link_button("\U0001F4AC Send on WhatsApp", link, use_container_width=True)
+        elif not off_days:
+            st.caption("_No off-days on file -- upload via Upload Monthly Data \u2192 Weekly Off-Days._")
+        elif not profile.get("phone"):
+            st.caption("_No phone number on file for this rider._")
+
     if rider_logs.empty:
         st.info("No monthly logs on file for this rider yet.")
         return
@@ -5523,6 +5791,88 @@ def render_rider_lookup(filters: dict):
 
 
 # ==============================================================================
+# WEEKLY SCHEDULE  -- bulk view of every rider's off-days with a one-click
+# WhatsApp send link each, plus the message template / country code settings.
+# ==============================================================================
+
+
+def render_weekly_schedule_tab():
+    st.subheader("\U0001F4C5 Weekly Schedule")
+    st.write(
+        "Every rider's weekly off-day(s), with a one-tap link to send them "
+        "their schedule on WhatsApp -- opens WhatsApp with the message ready "
+        "to go, so you (or a supervisor) just hit Send. Upload/update "
+        "off-days from **Upload Monthly Data \u2192 Weekly Off-Days**."
+    )
+
+    if is_admin():
+        with st.expander("\u2699\uFE0F Message & Country Code Settings", expanded=False):
+            wa_config = _load_whatsapp_config()
+            st.caption(
+                "The message template can use {name} and {off_days} -- they're "
+                "filled in per rider automatically."
+            )
+            new_template = st.text_area(
+                "Message template", value=wa_config["message_template"], key="wa_template_input", height=80,
+            )
+            new_country_code = st.text_input(
+                "Default country code (used when a phone number has no country code, e.g. starts with 0)",
+                value=wa_config["country_code"], key="wa_country_code_input",
+                help="Digits only, no '+' -- e.g. 92 for Pakistan, 966 for Saudi Arabia.",
+            )
+            if st.button("\U0001F4BE Save Settings", use_container_width=True):
+                _save_whatsapp_config(new_country_code.strip().lstrip("+"), new_template)
+                st.success("Saved.")
+                st.rerun()
+
+    drivers = load_drivers()
+    with_off_days = drivers[drivers["off_days"].notna() & (drivers["off_days"] != "")]
+    without_off_days = drivers[drivers["off_days"].isna() | (drivers["off_days"] == "")]
+
+    if with_off_days.empty:
+        st.info(
+            "No riders have off-days on file yet. Upload a sheet from "
+            "**Upload Monthly Data \u2192 Weekly Off-Days** to get started."
+        )
+        return
+
+    st.caption(f"{len(with_off_days)} rider(s) with off-days on file, {len(without_off_days)} without.")
+
+    wa_config = _load_whatsapp_config()
+    search = st.text_input(
+        "Filter by name", placeholder="\U0001F50D Type a name to filter...",
+        key="weekly_schedule_search", label_visibility="collapsed",
+    )
+    view = with_off_days
+    if search.strip():
+        view = view[view["driver_name"].str.lower().str.contains(search.strip().lower(), na=False)]
+
+    for _, row in view.sort_values("driver_name").iterrows():
+        c1, c2, c3 = st.columns([3, 2, 2])
+        with c1:
+            st.markdown(f"**{row['driver_name']}**")
+            st.caption(row["phone"] or "No phone on file")
+        with c2:
+            st.markdown(row["off_days"])
+        with c3:
+            if row["phone"]:
+                message = wa_config["message_template"].format(name=row["driver_name"], off_days=row["off_days"])
+                link = build_whatsapp_link(row["phone"], message, wa_config["country_code"])
+                if link:
+                    st.link_button("\U0001F4AC Send", link, use_container_width=True, key=f"wa_send_{row['driver_id']}")
+            else:
+                st.caption("No phone")
+        st.markdown("---")
+
+    if not without_off_days.empty:
+        with st.expander(f"\U0001F465 {len(without_off_days)} rider(s) with no off-days on file"):
+            st.dataframe(
+                without_off_days[["driver_id", "driver_name", "phone"]],
+                use_container_width=True, hide_index=True,
+            )
+
+
+# ==============================================================================
 # TAB 5: SUPERVISOR ACTION ALERT GENERATOR
 # ==============================================================================
 
@@ -5640,7 +5990,7 @@ def main():
         unsafe_allow_html=True,
     )
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         [
             "\U0001F4CA Operations Dashboard",
             "\U0001F4E1 Live Tracker (Google Sheets)",
@@ -5648,6 +5998,7 @@ def main():
             "\U0001F4E4 Upload Monthly Data",
             "\U0001F50D Rider Lookup",
             "\U0001F4E3 Supervisor Alerts",
+            "\U0001F4C5 Weekly Schedule",
         ]
     )
 
@@ -5663,6 +6014,8 @@ def main():
         render_rider_lookup(filters)
     with tab6:
         render_supervisor_alerts()
+    with tab7:
+        render_weekly_schedule_tab()
 
 
 if __name__ == "__main__":
