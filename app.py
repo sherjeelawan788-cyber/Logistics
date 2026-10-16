@@ -2147,8 +2147,15 @@ def _guess_column(columns: list, aliases: list) -> str:
     for col, norm in normed.items():
         if norm in aliases:
             return col
+    # Aliases jinmein "first"/"last" hain (first_name, last_name fields) wo
+    # First/Last Name columns ko match kar sakti hain; baaki fields nahi.
+    wants_split_name = any(("first" in a or "last" in a) for a in aliases)
     for col, norm in normed.items():
         if norm in _GENERIC_HEADER_STOPWORDS:
+            continue
+        if norm.startswith("unnamed"):
+            continue
+        if not wants_split_name and ("first name" in norm or "last name" in norm):
             continue
         for alias in aliases:
             if alias in norm or norm in alias:
