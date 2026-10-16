@@ -2968,7 +2968,10 @@ def load_daily_logs(driver_id: str, month_year: str) -> pd.DataFrame:
 def _classify_sheet(df: pd.DataFrame) -> str:
     cols = list(df.columns)
 
-    has_name = _guess_column(cols, FIELD_ALIASES["driver_name"]) != NONE_OPTION
+        has_name = (
+        _guess_column(cols, FIELD_ALIASES["driver_name"]) != NONE_OPTION
+        or _guess_column(cols, FIELD_ALIASES["first_name"]) != NONE_OPTION
+    )
     id_col = _guess_column(cols, FIELD_ALIASES["driver_id"])
     has_id = id_col != NONE_OPTION
 
