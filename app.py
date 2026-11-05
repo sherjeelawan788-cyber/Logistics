@@ -6028,10 +6028,5 @@ def main():
         render_weekly_schedule_tab()
 
 
-try:
-    exec(compile(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "excel_fixes.py"), encoding="utf-8").read(), "excel_fixes.py", "exec"), globals())
-except FileNotFoundError:
-    pass
-
 if __name__ == "__main__":
     main()
